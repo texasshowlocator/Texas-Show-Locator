@@ -2,9 +2,15 @@ name: Scrape Texas Card Shows
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 13 * * *"
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: texas-card-show-scraper
+  cancel-in-progress: false
 
 jobs:
   scrape:
@@ -13,6 +19,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -22,13 +30,25 @@ jobs:
       - name: Install packages
         run: pip install -r requirements.txt
 
-      - name: Run scraper
+      - name: Run scraper and compare events
         run: python scrape_tcdb.py
 
-      - name: Save spreadsheet files
+      - name: Save previous-run snapshot
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/previous_snapshot.csv
+          if git diff --cached --quiet; then
+            echo "Snapshot has no changes to commit."
+          else
+            git commit -m "Update Texas card show comparison snapshot"
+            git push origin HEAD:main
+          fi
+
+      - name: Save spreadsheet and change reports
         uses: actions/upload-artifact@v4
         with:
-          name: texas-card-shows
+          name: texas-card-show-reports
           path: output/
           if-no-files-found: error
           retention-days: 30
