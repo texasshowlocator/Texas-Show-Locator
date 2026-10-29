@@ -266,10 +266,10 @@ def main():
 
         # Find links to individual TCDB card show records.
         if (
-            parsed.netloc.lower().endswith("tcdb.com")
-            and parsed.path.lower().endswith("cardshows.cfm")
-            and params.get("ID")
-            and params.get("MODE", [""])[0].upper() == "VIEW"
+    parsed.netloc.lower().endswith("tcdb.com")
+    and parsed.path.lower().endswith("cardshows.cfm")
+    and params.get("ID")
+):
         ):
             if event_name:
                 event_links.append((event_name, event_url))
