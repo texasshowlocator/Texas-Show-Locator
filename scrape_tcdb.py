@@ -1,4 +1,5 @@
 import re
+from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
@@ -31,8 +32,13 @@ OUTPUT.mkdir(exist_ok=True)
 # --------------------------------------------------
 
 def clean(text):
-    """Remove extra whitespace."""
+    """Normalize whitespace."""
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def normalize(text):
+    """Normalize event names for matching."""
+    return re.sub(r"[^a-z0-9]+", " ", clean(text).lower()).strip()
 
 
 def get_soup(url):
@@ -46,91 +52,14 @@ def get_soup(url):
     return BeautifulSoup(response.text, "html.parser")
 
 
-def parse_date(text):
-    """Convert a recognizable date to YYYY-MM-DD."""
-    text = clean(text)
-
-    formats = [
-        "%A, %B %d, %Y",
-        "%B %d, %Y",
-        "%b %d, %Y",
-        "%m/%d/%Y",
-        "%m/%d/%y",
-        "%B %d %Y",
-        "%b %d %Y",
-    ]
-
-    for fmt in formats:
-        try:
-            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-
-    return ""
-
-
-def extract_dates(text):
+def parse_listing_date(text):
     """
-    Extract a start and end date when both are shown.
-    If only one date is available, use it for both columns.
+    Recognize date headings such as:
+    Friday, October 30, 2026
+    Saturday, November 7, 2026
     """
     text = clean(text)
 
-    # Numeric range: 11/14/2026 - 11/15/2026
-    match = re.search(
-        r"\b(\d{1,2}/\d{1,2}/\d{2,4})\s*"
-        r"(?:-|–|—|to)\s*"
-        r"(\d{1,2}/\d{1,2}/\d{2,4})\b",
-        text,
-        re.IGNORECASE,
-    )
-
-    if match:
-        start = parse_date(match.group(1))
-        end = parse_date(match.group(2))
-
-        if start:
-            return start, end or start
-
-    # Month-name range: November 14-15, 2026
-    match = re.search(
-        r"\b([A-Za-z]+)\s+(\d{1,2})\s*"
-        r"(?:-|–|—|to)\s*(\d{1,2}),?\s+(\d{4})\b",
-        text,
-    )
-
-    if match:
-        month, start_day, end_day, year = match.groups()
-
-        start = parse_date(f"{month} {start_day}, {year}")
-        end = parse_date(f"{month} {end_day}, {year}")
-
-        if start:
-            return start, end or start
-
-    # Single numeric date
-    match = re.search(
-        r"\b\d{1,2}/\d{1,2}/\d{2,4}\b",
-        text,
-    )
-
-    if match:
-        date = parse_date(match.group(0))
-        if date:
-            return date, date
-
-    # Single month-name date
-    match = re.search(
-        r"\b[A-Za-z]+\s+\d{1,2},?\s+\d{4}\b",
-        text,
-    )
-
-    if match:
-        date = parse_date(match.group(0))
-        if date:
-            return date, date
-
-    # Weekday followed by a month-name date
     match = re.search(
         r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|"
         r"Saturday|Sunday),?\s+"
@@ -139,111 +68,86 @@ def extract_dates(text):
         re.IGNORECASE,
     )
 
-    if match:
-        date = parse_date(match.group(1))
-        if date:
-            return date, date
+    if not match:
+        return ""
 
-    return "", ""
+    date_text = match.group(1)
+
+    for fmt in ("%B %d, %Y", "%B %d %Y"):
+        try:
+            return datetime.strptime(
+                date_text, fmt
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    return ""
 
 
-def extract_location(lines):
-    """
-    Extract venue and location details from the event page.
-    Does not use Google Maps or any external address lookup.
-    """
-    location_lines = []
-    started = False
+def is_event_link(url):
+    """Identify links to individual TCDB card show records."""
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
 
-    date_pattern = re.compile(
-        r"(Monday|Tuesday|Wednesday|Thursday|Friday|"
-        r"Saturday|Sunday),?.*\d{4}",
-        re.IGNORECASE,
+    return (
+        parsed.netloc.lower().endswith("tcdb.com")
+        and parsed.path.lower().endswith("cardshows.cfm")
+        and bool(params.get("ID"))
     )
 
-    stop_phrases = {
-        "notes:",
-        "going to this show?",
-        "see any inaccuracies?",
-        "add to calendar",
-        "directions",
-        "future dates",
-        "past dates",
-    }
 
-    for line in lines:
+def extract_event_links(soup):
+    """
+    Collect event links without requiring MODE=VIEW.
+    Preserve repeated event names in the order they appear.
+    """
+    links_by_name = defaultdict(deque)
+
+    for anchor in soup.find_all("a", href=True):
+        name = clean(anchor.get_text(" ", strip=True))
+        url = urljoin(SOURCE_URL, anchor["href"])
+
+        if not name or not is_event_link(url):
+            continue
+
+        # Ignore links that point back to the listing itself.
+        params = parse_qs(urlparse(url).query)
+
+        if params.get("MODE", [""])[0].upper() == "LOCATION":
+            continue
+
+        links_by_name[normalize(name)].append(url)
+
+    return links_by_name
+
+
+def get_location(lines, start_index, event_names):
+    """
+    Read the venue and city immediately after an event name.
+    Stop before the next event or date heading.
+    """
+    location_parts = []
+
+    for line in lines[start_index + 1:start_index + 5]:
         line = clean(line)
 
         if not line:
             continue
 
-        if date_pattern.search(line):
-            started = True
-            continue
-
-        if not started:
-            continue
-
-        if line.lower() in stop_phrases:
+        if parse_listing_date(line):
             break
 
-        # Skip obvious navigation and unrelated labels.
-        if line.lower() in {
-            "home",
-            "card shows",
-            "united states",
-            "usa",
-        }:
-            continue
-
-        location_lines.append(line)
-
-        # Avoid collecting large amounts of unrelated page text.
-        if len(location_lines) >= 4:
+        if normalize(line) in event_names:
             break
 
-    # Remove consecutive duplicate lines.
-    cleaned_lines = []
+        # The city/state line normally looks like "Austin, TX".
+        location_parts.append(line)
 
-    for line in location_lines:
-        if not cleaned_lines or line != cleaned_lines[-1]:
-            cleaned_lines.append(line)
+        if re.search(r",\s*[A-Z]{2}\b", line):
+            break
 
-    return ", ".join(cleaned_lines)
-
-
-def scrape_event(url, listing_name=""):
-    """Extract an event's details from its TCDB page."""
-    soup = get_soup(url)
-
-    lines = [
-        clean(line)
-        for line in soup.get_text("\n", strip=True).splitlines()
-    ]
-    lines = [line for line in lines if line]
-
-    page_text = clean(" ".join(lines))
-
-    # Prefer the event name from the Texas listing.
-    event_name = clean(listing_name)
-
-    if not event_name:
-        heading = soup.find(["h1", "h2", "h3"])
-
-        if heading:
-            event_name = clean(heading.get_text(" ", strip=True))
-        elif soup.title:
-            event_name = clean(soup.title.get_text())
-
-    start_date, end_date = extract_dates(page_text)
-    location = extract_location(lines)
-
-    return {
-        "Start Date": start_date,
-        "End Date": end_date,
-        "Event Name": event_name,
-        "Location and Address": location,
-    }
+    # Usually this combines the venue and city/state.
+    return ", ".join(location_parts)
 
 
 # --------------------------------------------------
@@ -251,96 +155,139 @@ def scrape_event(url, listing_name=""):
 # --------------------------------------------------
 
 def main():
-    print("Loading TCDB Texas card show listings...")
+    print("Loading the complete TCDB Texas listing...")
 
     soup = get_soup(SOURCE_URL)
 
-    event_links = []
+    # Use the listing page itself, rather than relying on individual
+    # event pages to determine which events exist.
+    raw_lines = soup.get_text("\n", strip=True).splitlines()
+    lines = [clean(line) for line in raw_lines if clean(line)]
 
-    for link in soup.find_all("a", href=True):
-        event_name = clean(link.get_text(" ", strip=True))
-        event_url = urljoin(SOURCE_URL, link["href"])
+    links_by_name = extract_event_links(soup)
+    event_names = set(links_by_name.keys())
 
-        parsed = urlparse(event_url)
-        params = parse_qs(parsed.query)
-
-        # Find links to individual TCDB card show records.
-        if (
-    parsed.netloc.lower().endswith("tcdb.com")
-    and parsed.path.lower().endswith("cardshows.cfm")
-    and params.get("ID")
-):
-        ):
-            if event_name:
-                event_links.append((event_name, event_url))
-
-    # Remove duplicate event URLs.
-    unique_events = []
-    seen_urls = set()
-
-    for event_name, event_url in event_links:
-        if event_url not in seen_urls:
-            seen_urls.add(event_url)
-            unique_events.append((event_name, event_url))
-
-    if not unique_events:
+    if not event_names:
         raise RuntimeError(
-            "No individual event links were found. "
-            "The TCDB page structure may have changed."
+            "No event links were found on the TCDB listing. "
+            "The website's link format may have changed."
         )
 
-    print(f"Found {len(unique_events)} event links.")
+    print(f"Found {sum(len(q) for q in links_by_name.values())} event links.")
 
-    results = []
+    events = []
+    current_date = ""
+    matched_links = 0
 
-    for index, (event_name, event_url) in enumerate(
-        unique_events,
-        start=1,
-    ):
-        try:
-            event = scrape_event(event_url, event_name)
-            results.append(event)
+    for index, line in enumerate(lines):
+        # Update the date whenever a new date heading appears.
+        listing_date = parse_listing_date(line)
 
-            print(
-                f"Processed {index}/{len(unique_events)}: "
-                f"{event['Event Name']}"
-            )
+        if listing_date:
+            current_date = listing_date
+            continue
 
-        except requests.RequestException as error:
-            print(f"Could not process {event_url}: {error}")
+        normalized_name = normalize(line)
 
-    if not results:
-        raise RuntimeError("No event details could be extracted.")
+        # Only process lines matching an actual event link.
+        if normalized_name not in links_by_name:
+            continue
 
-    # Keep exactly these four columns in this order.
-    columns = [
-        "Start Date",
-        "End Date",
-        "Event Name",
-        "Location and Address",
-    ]
+        if not links_by_name[normalized_name]:
+            continue
 
-    df = pd.DataFrame(results, columns=columns)
+        event_url = links_by_name[normalized_name].popleft()
+        matched_links += 1
+
+        location = get_location(
+            lines,
+            index,
+            event_names,
+        )
+
+        # The listing groups shows by individual calendar date.
+        # When only one date is available, use it in both date columns.
+        events.append({
+            "Start Date": current_date,
+            "End Date": current_date,
+            "Event Name": line,
+            "Location and Address": location,
+            "_Event URL": event_url,
+        })
+
+    if not events:
+        raise RuntimeError(
+            "The scraper found event links but could not match them "
+            "to the date-grouped listing. No spreadsheet was created."
+        )
+
+    # Report any event links that weren't matched to listing text.
+    unmatched = sum(len(q) for q in links_by_name.values())
+
+    print(f"Matched {matched_links} event listings.")
+
+    if unmatched:
+        print(
+            f"Warning: {unmatched} event links were not matched "
+            "to a listing line."
+        )
+
+    # Remove only exact duplicate records, not events that share a name.
+    df = pd.DataFrame(events)
 
     df = df.drop_duplicates(
-        subset=["Start Date", "End Date", "Event Name", "Location and Address"]
+        subset=[
+            "Start Date",
+            "End Date",
+            "Event Name",
+            "Location and Address",
+            "_Event URL",
+        ]
     )
 
+    # Keep the requested four columns, in the requested order.
+    df = df[
+        [
+            "Start Date",
+            "End Date",
+            "Event Name",
+            "Location and Address",
+        ]
+    ]
+
     df = df.sort_values(
-        by="Start Date",
+        by=["Start Date", "Event Name"],
         na_position="last",
         kind="stable",
     )
 
-    csv_path = OUTPUT / "tcdb_texas_card_shows.csv"
     excel_path = OUTPUT / "tcdb_texas_card_shows.xlsx"
+    csv_path = OUTPUT / "tcdb_texas_card_shows.csv"
+    debug_path = OUTPUT / "tcdb_debug.txt"
 
-    df.to_csv(csv_path, index=False)
     df.to_excel(excel_path, index=False)
+    df.to_csv(csv_path, index=False)
 
-    print(f"\nFinished. Exported {len(df)} events.")
+    # Save a simple audit report so missing matches can be investigated.
+    with open(debug_path, "w", encoding="utf-8") as file:
+        file.write(f"Source: {SOURCE_URL}\n")
+        file.write(f"Event links found: {matched_links + unmatched}\n")
+        file.write(f"Event listings matched: {matched_links}\n")
+        file.write(f"Unmatched event links: {unmatched}\n")
+        file.write(f"Rows exported: {len(df)}\n\n")
+        file.write("Exported event listings:\n")
+
+        for _, row in df.iterrows():
+            file.write(
+                f"{row['Start Date']} | "
+                f"{row['Event Name']} | "
+                f"{row['Location and Address']}\n"
+            )
+
+    print(f"Exported {len(df)} rows.")
     print(f"Excel file: {excel_path}")
     print(f"CSV file: {csv_path}")
+    print(f"Audit report: {debug_path}")
 
 
 if __name__ == "__main__":
