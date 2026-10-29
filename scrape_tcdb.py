@@ -1,214 +1,83 @@
-import re
-from datetime import datetime
-from pathlib import Path
-from urllib.parse import urljoin
+def scrape_event(url):
+    soup = get_soup(url)
+    text = soup.get_text("\n", strip=True)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-import pandas as pd
-import requests
-from bs4 import BeautifulSoup
-
-SOURCE_URL = (
-    "https://www.tcdb.com/CardShows.cfm"
-    "?MODE=Location&State=TX&Display=Texas"
-    "&Country=United%20States"
-)
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; TexasShowLocator/1.0)"
-}
-
-OUTPUT = Path("output")
-OUTPUT.mkdir(exist_ok=True)
-
-DATE_RE = re.compile(
-    r"^(?:(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s*)?"
-    r"([A-Z][a-z]+ \d{1,2}, \d{4})$",
-    re.IGNORECASE,
-)
-CITY_RE = re.compile(r"^(.+?),\s*TX$", re.IGNORECASE)
-TIME_RE = re.compile(
-    r"^\d{1,2}(?::\d{2})?\s*[AP]M\s*-\s*"
-    r"\d{1,2}(?::\d{2})?\s*[AP]M$",
-    re.IGNORECASE,
-)
-
-
-def clean(value):
-    return re.sub(r"\s+", " ", value or "").strip()
-
-
-def parse_date(line):
-    match = DATE_RE.match(clean(line))
-    if not match:
-        return None
-
-    try:
-        return datetime.strptime(
-            match.group(1), "%B %d, %Y"
-        ).date()
-    except ValueError:
-        return None
-
-
-def main():
-    response = requests.get(
-        SOURCE_URL, headers=HEADERS, timeout=40
+    heading = soup.find(["h1", "h2", "h3"])
+    event_name = (
+        heading.get_text(" ", strip=True)
+        if heading else "Unknown Event"
     )
-    response.raise_for_status()
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    # Find the primary date listed for this event.
+    date_match = DATE_RE.search(text)
+    start_date = ""
+    end_date = ""
 
-    # Preserve the page's displayed order.
-    lines = [
-        clean(line)
-        for line in soup.get_text("\n").splitlines()
-        if clean(line)
-    ]
+    if date_match:
+        start_date = datetime.strptime(
+            date_match.group(2), "%B %d, %Y"
+        ).date()
+        end_date = start_date
 
-    # Map visible event names to their actual links.
-    event_links = {}
+        # Look for a date range such as July 4-5, 2026.
+        range_pattern = re.compile(
+            r"\b(January|February|March|April|May|June|"
+            r"July|August|September|October|November|December)"
+            r"\s+(\d{1,2})\s*[-–]\s*(\d{1,2}),?\s+(\d{4})\b",
+            re.IGNORECASE,
+        )
 
-    for a in soup.find_all("a", href=True):
-        name = clean(a.get_text(" ", strip=True))
-        href = a["href"]
+        for match in range_pattern.finditer(text):
+            month, first_day, last_day, year = match.groups()
 
-        if not name:
-            continue
+            try:
+                range_start = datetime.strptime(
+                    f"{month} {first_day} {year}", "%B %d %Y"
+                ).date()
 
-        full_url = urljoin(SOURCE_URL, href)
+                range_end = datetime.strptime(
+                    f"{month} {last_day} {year}", "%B %d %Y"
+                ).date()
 
-        # Exclude external navigation and unrelated page links.
-        if "tcdb.com/CardShows.cfm" in full_url:
-            event_links.setdefault(name.casefold(), full_url)
+                # Only accept a range that begins on the event's
+                # primary date, avoiding unrelated dates in notes.
+                if range_start == start_date and range_end >= range_start:
+                    end_date = range_end
+                    break
+            except ValueError:
+                continue
 
-    events = []
-    current_date = None
+    city = ""
+    venue = ""
 
     for i, line in enumerate(lines):
-        found_date = parse_date(line)
+        if re.search(r",\s*TX(?:\s|$)", line, re.IGNORECASE):
+            city = re.sub(
+                r",\s*TX.*$", "", line, flags=re.IGNORECASE
+            ).strip()
 
-        if found_date:
-            current_date = found_date
-            continue
+            if i >= 1:
+                venue = lines[i - 1]
+            break
 
-        if not current_date:
-            continue
+    review = []
 
-        # An event listing starts with a linked event name.
-        event_url = event_links.get(line.casefold())
+    if not start_date:
+        review.append("Start date not found")
+    if not venue:
+        review.append("Venue not detected")
+    if not city:
+        review.append("City not detected")
 
-        if not event_url:
-            continue
-
-        # Read ahead until the next event link or date heading.
-        details = []
-
-        for candidate in lines[i + 1:i + 6]:
-            if parse_date(candidate):
-                break
-
-            # Stop if the next event name appears.
-            if candidate.casefold() in event_links:
-                break
-
-            details.append(candidate)
-
-        venue = ""
-        city = ""
-        time = ""
-
-        for detail in details:
-            city_match = CITY_RE.match(detail)
-
-            if city_match:
-                city = clean(city_match.group(1))
-            elif TIME_RE.match(detail):
-                time = detail
-            elif not venue:
-                venue = detail
-
-        review = []
-
-        if not venue:
-            review.append("Venue not detected")
-        if not city:
-            review.append("City not detected")
-        if not time:
-            review.append("Time not detected")
-
-        events.append({
-            "Start Date": current_date,
-            "End Date": "",
-            "Event Name": line,
-            "Venue": venue,
-            "City": city,
-            "State": "TX",
-            "Time": time,
-            "Source Website": "TCDB",
-            "Event URL": event_url,
-            "Review Needed": "; ".join(review),
-        })
-
-    if not events:
-        # Save page text to help diagnose an unexpected layout.
-        (OUTPUT / "tcdb_debug.txt").write_text(
-            "\n".join(lines), encoding="utf-8"
-        )
-        raise RuntimeError(
-            "No events found. Check output/tcdb_debug.txt "
-            "in the workflow artifacts or logs."
-        )
-
-    df = pd.DataFrame(events)
-
-    # Remove exact duplicate records, preserving separate dates,
-    # venues, and times for multi-day events.
-    df = df.drop_duplicates(
-        subset=[
-            "Start Date", "Event Name", "Venue",
-            "City", "Time", "Event URL"
-        ]
-    )
-
-    df = df.sort_values(
-        ["Start Date", "City", "Event Name"],
-        na_position="last",
-    ).reset_index(drop=True)
-
-    df.to_csv(
-        OUTPUT / "texas_card_shows.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
-
-    with pd.ExcelWriter(
-        OUTPUT / "texas_card_shows.xlsx",
-        engine="openpyxl",
-        date_format="mm/dd/yyyy",
-    ) as writer:
-        df.to_excel(writer, index=False, sheet_name="Texas Shows")
-        ws = writer.sheets["Texas Shows"]
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-
-        for cells in ws.columns:
-            width = max(
-                len(str(cell.value or "")) for cell in cells
-            )
-            ws.column_dimensions[
-                cells[0].column_letter
-            ].width = min(width + 2, 55)
-
-    print(f"Source URL: {SOURCE_URL}")
-    print(f"Unique event records extracted: {len(df)}")
-    print(
-        "Records needing review: "
-        f"{(df['Review Needed'] != '').sum()}"
-    )
-    print("Output files created:")
-    print(" - output/texas_card_shows.csv")
-    print(" - output/texas_card_shows.xlsx")
-
-
-if __name__ == "__main__":
-    main()
+    return {
+        "Start Date": start_date,
+        "End Date": end_date,
+        "Event Name": event_name,
+        "Venue": venue,
+        "City": city,
+        "State": "TX",
+        "Source Website": "TCDB",
+        "Event URL": url,
+        "Review Needed": "; ".join(review),
+    }
