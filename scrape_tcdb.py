@@ -1,3 +1,4 @@
+import json
 import re
 from collections import Counter, defaultdict, deque
 from datetime import datetime
@@ -13,66 +14,122 @@ from bs4 import BeautifulSoup
 # SETTINGS
 # --------------------------------------------------
 
-SOURCE_URL = (
+TCDB_URL = (
     "https://www.tcdb.com/CardShows.cfm"
     "?MODE=Location&State=TX&Display=Texas"
     "&Country=United%20States"
 )
 
+ONTREASURE_URL = "https://www.ontreasure.com/events?states=TX"
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; TexasShowLocator/1.0)"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
 }
 
 OUTPUT = Path("output")
 OUTPUT.mkdir(parents=True, exist_ok=True)
-
 SNAPSHOT_PATH = Path("data/previous_snapshot.csv")
 
 COLUMNS = [
     "Start Date",
     "End Date",
     "Event Name",
-    "Location and Address",
+    "Event Location",
+    "Source Website",
 ]
-
 CHANGE_COLUMNS = ["Change Type"] + COLUMNS
 
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
 
 # --------------------------------------------------
-# HELPER FUNCTIONS
+# COMMON HELPERS
 # --------------------------------------------------
 
-def clean(text):
-    """Normalize whitespace."""
-    return re.sub(r"\s+", " ", text or "").strip()
+def clean(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
-def normalize(text):
-    """Normalize event names for matching."""
-    return re.sub(
-        r"[^a-z0-9]+", " ", clean(text).lower()
-    ).strip()
+def normalize(value):
+    return re.sub(r"[^a-z0-9]+", " ", clean(value).lower()).strip()
 
 
 def get_soup(url):
-    """Download and parse a webpage."""
-    response = requests.get(
-        url,
-        headers=HEADERS,
-        timeout=30,
-    )
+    response = SESSION.get(url, timeout=40)
     response.raise_for_status()
+    if not response.text.strip():
+        raise RuntimeError(f"Empty response from {url}")
     return BeautifulSoup(response.text, "html.parser")
 
 
-def parse_listing_date(text):
-    """
-    Recognize date headings such as:
-    Friday, October 30, 2026
-    Saturday, November 7, 2026
-    """
-    text = clean(text)
+def event_counter(df):
+    return Counter(
+        map(
+            tuple,
+            df[COLUMNS].fillna("").astype(str).to_numpy().tolist(),
+        )
+    )
 
+
+def load_previous_snapshot():
+    if not SNAPSHOT_PATH.exists() or SNAPSHOT_PATH.stat().st_size == 0:
+        return None
+
+    old = pd.read_csv(
+        SNAPSHOT_PATH, dtype=str, keep_default_na=False
+    )
+
+    # Migrate the older TCDB-only snapshot without making every
+    # existing TCDB row look new merely because a source column was added.
+    if "Source Website" not in old.columns:
+        old["Source Website"] = "TCDB"
+
+    for col in COLUMNS:
+        if col not in old.columns:
+            old[col] = ""
+
+    return old[COLUMNS].fillna("").astype(str)
+
+
+def compare_snapshots(current, previous):
+    if previous is None:
+        return pd.DataFrame(columns=CHANGE_COLUMNS)
+
+    before = event_counter(previous)
+    after = event_counter(current)
+    changes = []
+
+    for row, count in (after - before).items():
+        for _ in range(count):
+            changes.append({"Change Type": "New", **dict(zip(COLUMNS, row))})
+
+    for row, count in (before - after).items():
+        for _ in range(count):
+            changes.append({
+                "Change Type": "Removed",
+                **dict(zip(COLUMNS, row)),
+            })
+
+    result = pd.DataFrame(changes, columns=CHANGE_COLUMNS)
+    if not result.empty:
+        result = result.sort_values(
+            ["Change Type", "Start Date", "Event Name"],
+            kind="stable",
+        ).reset_index(drop=True)
+    return result
+
+
+# --------------------------------------------------
+# TCDB PARSER
+# --------------------------------------------------
+
+def parse_tcdb_date(text):
+    text = clean(text)
     match = re.search(
         r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|"
         r"Saturday|Sunday),?\s+"
@@ -80,312 +137,365 @@ def parse_listing_date(text):
         text,
         re.IGNORECASE,
     )
-
     if not match:
         return ""
 
-    date_text = match.group(1)
-
     for fmt in ("%B %d, %Y", "%B %d %Y"):
         try:
-            return datetime.strptime(
-                date_text, fmt
-            ).strftime("%Y-%m-%d")
+            return datetime.strptime(match.group(1), fmt).strftime("%Y-%m-%d")
         except ValueError:
             pass
-
     return ""
 
 
-def is_event_link(url):
-    """Identify links to individual TCDB card show records."""
+def is_tcdb_event_link(url):
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
-
     return (
         parsed.netloc.lower().endswith("tcdb.com")
         and parsed.path.lower().endswith("cardshows.cfm")
         and bool(params.get("ID"))
+        and params.get("MODE", [""])[0].upper() != "LOCATION"
     )
 
 
-def extract_event_links(soup):
-    """
-    Collect individual event links from the listing.
-    Preserve repeated event names in their original order.
-    """
-    links_by_name = defaultdict(deque)
+def scrape_tcdb():
+    print("Scraping TCDB...")
+    soup = get_soup(TCDB_URL)
+    lines = [
+        clean(line)
+        for line in soup.get_text("\n", strip=True).splitlines()
+        if clean(line)
+    ]
 
-    for anchor in soup.find_all("a", href=True):
-        name = clean(anchor.get_text(" ", strip=True))
-        url = urljoin(SOURCE_URL, anchor["href"])
+    links = defaultdict(deque)
+    for a in soup.find_all("a", href=True):
+        name = clean(a.get_text(" ", strip=True))
+        url = urljoin(TCDB_URL, a["href"])
+        if name and is_tcdb_event_link(url):
+            links[normalize(name)].append(url)
 
-        if not name or not is_event_link(url):
-            continue
+    total_links = sum(len(q) for q in links.values())
+    if total_links == 0:
+        raise RuntimeError("TCDB validation failed: no event links found.")
 
-        params = parse_qs(urlparse(url).query)
-
-        # Ignore links pointing back to the listing itself.
-        if params.get("MODE", [""])[0].upper() == "LOCATION":
-            continue
-
-        links_by_name[normalize(name)].append(url)
-
-    return links_by_name
-
-
-def get_location(lines, start_index, event_names):
-    """
-    Read the venue and city immediately after an event name.
-    Stop before the next event or date heading.
-    """
-    location_parts = []
-
-    for line in lines[start_index + 1:start_index + 5]:
-        line = clean(line)
-
-        if not line:
-            continue
-
-        if parse_listing_date(line):
-            break
-
-        if normalize(line) in event_names:
-            break
-
-        location_parts.append(line)
-
-        # City/state lines commonly look like "Austin, TX".
-        if re.search(r",\s*[A-Z]{2}\b", line):
-            break
-
-    return ", ".join(location_parts)
-
-
-def row_counter(dataframe):
-    """
-    Count event rows so identical duplicate rows are handled
-    consistently when comparing snapshots.
-    """
-    return Counter(
-        map(
-            tuple,
-            dataframe[COLUMNS].fillna("").astype(str).to_numpy().tolist(),
-        )
-    )
-
-
-def create_change_report(current_df):
-    """
-    Compare the current successful scrape against the previous
-    snapshot. Return a changes dataframe and the baseline status.
-    """
-    SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    if not SNAPSHOT_PATH.exists() or SNAPSHOT_PATH.stat().st_size == 0:
-        print(
-            "No previous snapshot found. "
-            "This run will establish the initial baseline."
-        )
-        return pd.DataFrame(columns=CHANGE_COLUMNS), False
-
-    previous_df = pd.read_csv(
-        SNAPSHOT_PATH,
-        dtype=str,
-        keep_default_na=False,
-    )
-
-    if not all(column in previous_df.columns for column in COLUMNS):
-        raise RuntimeError(
-            "The previous snapshot is missing required columns. "
-            "The snapshot will not be replaced."
-        )
-
-    previous_df = previous_df[COLUMNS].fillna("").astype(str)
-    current_df = current_df[COLUMNS].fillna("").astype(str)
-
-    previous_counts = row_counter(previous_df)
-    current_counts = row_counter(current_df)
-
-    changes = []
-
-    # Events appearing more often now are new listings.
-    for row, count in (current_counts - previous_counts).items():
-        for _ in range(count):
-            changes.append({
-                "Change Type": "New",
-                **dict(zip(COLUMNS, row)),
-            })
-
-    # Events appearing less often now are removed listings.
-    for row, count in (previous_counts - current_counts).items():
-        for _ in range(count):
-            changes.append({
-                "Change Type": "Removed",
-                **dict(zip(COLUMNS, row)),
-            })
-
-    changes_df = pd.DataFrame(changes, columns=CHANGE_COLUMNS)
-
-    if not changes_df.empty:
-        changes_df = changes_df.sort_values(
-            by=["Change Type", "Start Date", "Event Name"],
-            kind="stable",
-        ).reset_index(drop=True)
-
-    return changes_df, True
-
-
-# --------------------------------------------------
-# MAIN SCRAPER
-# --------------------------------------------------
-
-def main():
-    print("Loading the complete TCDB Texas listing...")
-
-    soup = get_soup(SOURCE_URL)
-
-    raw_lines = soup.get_text("\n", strip=True).splitlines()
-    lines = [clean(line) for line in raw_lines if clean(line)]
-
-    links_by_name = extract_event_links(soup)
-    event_names = set(links_by_name.keys())
-
-    if not event_names:
-        raise RuntimeError(
-            "No event links were found on the TCDB listing. "
-            "The website may have changed or returned an incomplete page. "
-            "No snapshot will be updated."
-        )
-
-    total_links = sum(len(queue) for queue in links_by_name.values())
-    print(f"Found {total_links} event links.")
-
-    events = []
+    event_names = set(links)
     current_date = ""
-    matched_links = 0
+    events = []
 
-    for index, line in enumerate(lines):
-        listing_date = parse_listing_date(line)
-
-        if listing_date:
-            current_date = listing_date
+    for i, line in enumerate(lines):
+        date = parse_tcdb_date(line)
+        if date:
+            current_date = date
             continue
 
-        normalized_name = normalize(line)
-
-        if normalized_name not in links_by_name:
+        key = normalize(line)
+        if key not in links or not links[key]:
             continue
 
-        if not links_by_name[normalized_name]:
-            continue
+        links[key].popleft()
+        location_parts = []
 
-        # Consume one matching link for each occurrence of an event name.
-        links_by_name[normalized_name].popleft()
-        matched_links += 1
+        for following in lines[i + 1:i + 5]:
+            if parse_tcdb_date(following):
+                break
+            if normalize(following) in event_names:
+                break
+            location_parts.append(following)
+            if re.search(r",\s*[A-Z]{2}\b", following):
+                break
 
-        location = get_location(
-            lines,
-            index,
-            event_names,
-        )
-
-        # TCDB groups shows by individual calendar date.
-        # Use the listed date for both date columns.
         events.append({
             "Start Date": current_date,
             "End Date": current_date,
             "Event Name": line,
-            "Location and Address": location,
+            "Event Location": ", ".join(location_parts),
+            "Source Website": "TCDB",
         })
 
     if not events:
         raise RuntimeError(
-            "The scraper found event links but could not match them "
-            "to the date-grouped listing. No snapshot will be updated."
+            "TCDB validation failed: links were found but no event rows matched."
         )
 
-    unmatched_links = sum(len(queue) for queue in links_by_name.values())
+    df = pd.DataFrame(events, columns=COLUMNS).drop_duplicates()
+    print(f"TCDB: collected {len(df)} event rows.")
+    return df
 
-    print(f"Matched {matched_links} event listings.")
 
-    if unmatched_links:
-        print(
-            f"Warning: {unmatched_links} event links did not match "
-            "a listing line. Review the audit report."
+# --------------------------------------------------
+# ONTREASURE PARSER
+# --------------------------------------------------
+
+MONTHS = (
+    "January February March April May June July August "
+    "September October November December"
+).split()
+MONTH_PATTERN = "|".join(
+    [m for month in MONTHS for m in (month, month[:3])]
+)
+
+
+def parse_month_day_year(text, default_year):
+    pattern = (
+        rf"\b({MONTH_PATTERN})\.?\s+(\d{{1,2}})"
+        rf"(?:,?\s+(\d{{4}}))?\b"
+    )
+    dates = []
+    for match in re.finditer(pattern, text, re.IGNORECASE):
+        month_text, day_text, year_text = match.groups()
+        try:
+            month_number = next(
+                i for i, month in enumerate(MONTHS, 1)
+                if month.lower().startswith(month_text.lower()[:3])
+            )
+            year = int(year_text) if year_text else default_year
+            dates.append(datetime(year, month_number, int(day_text)))
+        except (ValueError, StopIteration):
+            continue
+    return dates
+
+
+def event_detail_links(soup):
+    found = []
+    seen = set()
+
+    for a in soup.find_all("a", href=True):
+        url = urljoin(ONTREASURE_URL, a["href"])
+        parsed = urlparse(url)
+
+        if parsed.netloc.lower() != "www.ontreasure.com":
+            continue
+        if not parsed.path.startswith("/events/"):
+            continue
+        if parsed.path.rstrip("/").endswith("/tickets"):
+            continue
+        if url in seen:
+            continue
+
+        seen.add(url)
+        found.append(url)
+
+    return found
+
+
+def find_event_jsonld(soup):
+    """Use structured event data when the site provides it."""
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or script.get_text())
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        candidates = data if isinstance(data, list) else [data]
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            if "@graph" in item and isinstance(item["@graph"], list):
+                candidates.extend(item["@graph"])
+            item_type = item.get("@type", "")
+            if isinstance(item_type, list):
+                is_event = "Event" in item_type
+            else:
+                is_event = item_type == "Event"
+            if is_event:
+                return item
+    return None
+
+
+def scrape_ontreasure_detail(url):
+    soup = get_soup(url)
+    json_event = find_event_jsonld(soup)
+
+    page_text = clean(soup.get_text(" ", strip=True))
+    title_tag = soup.find("h1")
+    title = clean(title_tag.get_text(" ", strip=True)) if title_tag else ""
+
+    if not title:
+        og_title = soup.find("meta", property="og:title")
+        title = clean(og_title.get("content", "")) if og_title else ""
+    if not title and json_event:
+        title = clean(json_event.get("name", ""))
+
+    if not title:
+        raise RuntimeError(f"OnTreasure event page has no title: {url}")
+
+    start_date = ""
+    end_date = ""
+    location = ""
+
+    if json_event:
+        start_value = clean(json_event.get("startDate", ""))
+        end_value = clean(json_event.get("endDate", ""))
+
+        try:
+            start_date = datetime.fromisoformat(
+                start_value.replace("Z", "+00:00")
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+        try:
+            end_date = datetime.fromisoformat(
+                end_value.replace("Z", "+00:00")
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+        loc_data = json_event.get("location", {})
+        if isinstance(loc_data, dict):
+            address = loc_data.get("address", {})
+            if isinstance(address, dict):
+                location = ", ".join(
+                    clean(address.get(k, ""))
+                    for k in ("streetAddress", "addressLocality",
+                              "addressRegion", "postalCode")
+                    if clean(address.get(k, ""))
+                )
+            elif isinstance(address, str):
+                location = clean(address)
+            if not location:
+                location = clean(loc_data.get("name", ""))
+
+    # Fallback: extract dates from the event heading/page text.
+    if not start_date:
+        current_year = datetime.now().year
+        year_match = re.search(r"\b20\d{2}\b", title)
+        if year_match:
+            current_year = int(year_match.group(0))
+
+        dates = parse_month_day_year(title, current_year)
+        if not dates:
+            dates = parse_month_day_year(page_text[:2500], current_year)
+
+        if dates:
+            start_date = min(dates).strftime("%Y-%m-%d")
+            end_date = max(dates).strftime("%Y-%m-%d")
+
+    if not end_date:
+        end_date = start_date
+
+    # Fallback: use the page's location metadata or Texas city/state text.
+    if not location:
+        for meta_name in ("og:description", "description"):
+            meta = soup.find("meta", property=meta_name) or soup.find(
+                "meta", attrs={"name": meta_name}
+            )
+            if meta and meta.get("content"):
+                description = clean(meta["content"])
+                match = re.search(
+                    r"([A-Za-z .'-]+,\s*TX(?:\s+\d{5})?)",
+                    description,
+                )
+                if match:
+                    location = match.group(1)
+                    break
+
+    if not location:
+        match = re.search(
+            r"\b([A-Za-z .'-]+,\s*TX(?:\s+\d{5})?)\b",
+            page_text[:5000],
+        )
+        if match:
+            location = match.group(1)
+
+    return {
+        "Start Date": start_date,
+        "End Date": end_date,
+        "Event Name": title,
+        "Event Location": location,
+        "Source Website": "OnTreasure",
+    }
+
+
+def scrape_ontreasure():
+    print("Scraping OnTreasure...")
+    soup = get_soup(ONTREASURE_URL)
+    links = event_detail_links(soup)
+
+    if not links:
+        raise RuntimeError(
+            "OnTreasure validation failed: no event detail links found. "
+            "The site may require JavaScript or may have changed its layout."
         )
 
-    # Remove exact duplicate records while retaining distinct events.
-    df = pd.DataFrame(events, columns=COLUMNS)
-    df = df.drop_duplicates(subset=COLUMNS)
+    events = []
+    errors = []
 
-    df = df.sort_values(
-        by=["Start Date", "Event Name"],
-        na_position="last",
+    for url in links:
+        try:
+            event = scrape_ontreasure_detail(url)
+            # Only keep listings with at least a usable event date.
+            if not event["Start Date"]:
+                errors.append(f"No date parsed: {url}")
+                continue
+            events.append(event)
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+
+    # Do not treat a partially scraped source as complete. This prevents
+    # a partial page or temporary failure from making events look removed.
+    if errors:
+        preview = "\n".join(errors[:10])
+        raise RuntimeError(
+            f"OnTreasure validation failed: {len(errors)} of {len(links)} "
+            f"event pages could not be parsed. Snapshot will not be updated.\n"
+            f"{preview}"
+        )
+
+    if not events:
+        raise RuntimeError("OnTreasure validation failed: no event rows parsed.")
+
+    df = pd.DataFrame(events, columns=COLUMNS).drop_duplicates()
+    print(f"OnTreasure: collected {len(df)} event rows.")
+    return df
+
+
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
+
+def main():
+    # Both sources must pass validation before the combined snapshot changes.
+    tcdb_df = scrape_tcdb()
+    ontreasure_df = scrape_ontreasure()
+
+    current = pd.concat([tcdb_df, ontreasure_df], ignore_index=True)
+    current = current[COLUMNS].fillna("").astype(str).drop_duplicates()
+
+    current = current.sort_values(
+        ["Start Date", "Event Name", "Source Website"],
         kind="stable",
+        na_position="last",
     ).reset_index(drop=True)
 
-    # Compare with the last successful snapshot before replacing it.
-    changes_df, had_baseline = create_change_report(df)
+    SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    previous = load_previous_snapshot()
+    changes = compare_snapshots(current, previous)
 
-    # --------------------------------------------------
-    # EXPORT CURRENT LISTING AND CHANGE REPORT
-    # --------------------------------------------------
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    current.to_excel(OUTPUT / "texas_card_shows.xlsx", index=False)
+    current.to_csv(OUTPUT / "texas_card_shows.csv", index=False)
+    changes.to_excel(OUTPUT / "daily_changes.xlsx", index=False)
+    changes.to_csv(OUTPUT / "daily_changes.csv", index=False)
 
-    excel_path = OUTPUT / "tcdb_texas_card_shows.xlsx"
-    csv_path = OUTPUT / "tcdb_texas_card_shows.csv"
-    changes_excel_path = OUTPUT / "tcdb_daily_changes.xlsx"
-    changes_csv_path = OUTPUT / "tcdb_daily_changes.csv"
-    debug_path = OUTPUT / "tcdb_debug.txt"
+    with open(OUTPUT / "scrape_audit.txt", "w", encoding="utf-8") as f:
+        f.write(f"Run time: {datetime.now().isoformat(timespec='seconds')}\n")
+        f.write(f"TCDB URL: {TCDB_URL}\n")
+        f.write(f"OnTreasure URL: {ONTREASURE_URL}\n")
+        f.write(f"TCDB rows: {len(tcdb_df)}\n")
+        f.write(f"OnTreasure rows: {len(ontreasure_df)}\n")
+        f.write(f"Combined rows: {len(current)}\n")
+        f.write(f"New rows: {int((changes['Change Type'] == 'New').sum()) if not changes.empty else 0}\n")
+        f.write(f"Removed rows: {int((changes['Change Type'] == 'Removed').sum()) if not changes.empty else 0}\n")
+        f.write("\nNote: matching is based on all exported columns, including source.\n")
 
-    # Full current listing.
-    df.to_excel(excel_path, index=False)
-    df.to_csv(csv_path, index=False)
+    # Update the persistent baseline only after both sources and exports succeed.
+    current.to_csv(SNAPSHOT_PATH, index=False)
 
-    # Only newly added and removed event listings.
-    changes_df.to_excel(changes_excel_path, index=False)
-    changes_df.to_csv(changes_csv_path, index=False)
-
-    new_count = (
-        int((changes_df["Change Type"] == "New").sum())
-        if not changes_df.empty else 0
-    )
-    removed_count = (
-        int((changes_df["Change Type"] == "Removed").sum())
-        if not changes_df.empty else 0
-    )
-
-    # Write the audit report before updating the snapshot.
-    with open(debug_path, "w", encoding="utf-8") as file:
-        file.write(f"Source: {SOURCE_URL}\n")
-        file.write(f"Event links found: {total_links}\n")
-        file.write(f"Event listings matched: {matched_links}\n")
-        file.write(f"Unmatched event links: {unmatched_links}\n")
-        file.write(f"Rows exported: {len(df)}\n")
-        file.write(f"Previous baseline existed: {had_baseline}\n")
-        file.write(f"New listings: {new_count}\n")
-        file.write(f"Removed listings: {removed_count}\n\n")
-        file.write("Exported event listings:\n")
-
-        for _, row in df.iterrows():
-            file.write(
-                f"{row['Start Date']} | "
-                f"{row['End Date']} | "
-                f"{row['Event Name']} | "
-                f"{row['Location and Address']}\n"
-            )
-
-    # Update the baseline only after scraping and report exports succeed.
-    # GitHub Actions must commit this file to preserve it between runs.
-    df[COLUMNS].to_csv(SNAPSHOT_PATH, index=False)
-
-    print(f"Exported {len(df)} current event rows.")
-    print(f"New event listings: {new_count}")
-    print(f"Removed event listings: {removed_count}")
-    print(f"Full Excel listing: {excel_path}")
-    print(f"Daily changes report: {changes_excel_path}")
-    print(f"Audit report: {debug_path}")
-    print(f"Comparison snapshot: {SNAPSHOT_PATH}")
+    print(f"Combined rows: {len(current)}")
+    print(f"New rows: {int((changes['Change Type'] == 'New').sum()) if not changes.empty else 0}")
+    print(f"Removed rows: {int((changes['Change Type'] == 'Removed').sum()) if not changes.empty else 0}")
+    print("Reports saved in output/.")
 
 
 if __name__ == "__main__":
