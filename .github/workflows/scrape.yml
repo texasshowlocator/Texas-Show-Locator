@@ -1,0 +1,34 @@
+name: Scrape Texas Card Shows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packages
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        run: python scrape_tcdb.py
+
+      - name: Save spreadsheet files
+        uses: actions/upload-artifact@v4
+        with:
+          name: texas-card-shows
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
