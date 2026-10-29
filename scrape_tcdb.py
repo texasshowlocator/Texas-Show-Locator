@@ -1,5 +1,5 @@
 import re
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
@@ -24,7 +24,18 @@ HEADERS = {
 }
 
 OUTPUT = Path("output")
-OUTPUT.mkdir(exist_ok=True)
+OUTPUT.mkdir(parents=True, exist_ok=True)
+
+SNAPSHOT_PATH = Path("data/previous_snapshot.csv")
+
+COLUMNS = [
+    "Start Date",
+    "End Date",
+    "Event Name",
+    "Location and Address",
+]
+
+CHANGE_COLUMNS = ["Change Type"] + COLUMNS
 
 
 # --------------------------------------------------
@@ -38,7 +49,9 @@ def clean(text):
 
 def normalize(text):
     """Normalize event names for matching."""
-    return re.sub(r"[^a-z0-9]+", " ", clean(text).lower()).strip()
+    return re.sub(
+        r"[^a-z0-9]+", " ", clean(text).lower()
+    ).strip()
 
 
 def get_soup(url):
@@ -98,8 +111,8 @@ def is_event_link(url):
 
 def extract_event_links(soup):
     """
-    Collect event links without requiring MODE=VIEW.
-    Preserve repeated event names in the order they appear.
+    Collect individual event links from the listing.
+    Preserve repeated event names in their original order.
     """
     links_by_name = defaultdict(deque)
 
@@ -110,9 +123,9 @@ def extract_event_links(soup):
         if not name or not is_event_link(url):
             continue
 
-        # Ignore links that point back to the listing itself.
         params = parse_qs(urlparse(url).query)
 
+        # Ignore links pointing back to the listing itself.
         if params.get("MODE", [""])[0].upper() == "LOCATION":
             continue
 
@@ -140,14 +153,87 @@ def get_location(lines, start_index, event_names):
         if normalize(line) in event_names:
             break
 
-        # The city/state line normally looks like "Austin, TX".
         location_parts.append(line)
 
+        # City/state lines commonly look like "Austin, TX".
         if re.search(r",\s*[A-Z]{2}\b", line):
             break
 
-    # Usually this combines the venue and city/state.
     return ", ".join(location_parts)
+
+
+def row_counter(dataframe):
+    """
+    Count event rows so identical duplicate rows are handled
+    consistently when comparing snapshots.
+    """
+    return Counter(
+        map(
+            tuple,
+            dataframe[COLUMNS].fillna("").astype(str).to_numpy().tolist(),
+        )
+    )
+
+
+def create_change_report(current_df):
+    """
+    Compare the current successful scrape against the previous
+    snapshot. Return a changes dataframe and the baseline status.
+    """
+    SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    if not SNAPSHOT_PATH.exists() or SNAPSHOT_PATH.stat().st_size == 0:
+        print(
+            "No previous snapshot found. "
+            "This run will establish the initial baseline."
+        )
+        return pd.DataFrame(columns=CHANGE_COLUMNS), False
+
+    previous_df = pd.read_csv(
+        SNAPSHOT_PATH,
+        dtype=str,
+        keep_default_na=False,
+    )
+
+    if not all(column in previous_df.columns for column in COLUMNS):
+        raise RuntimeError(
+            "The previous snapshot is missing required columns. "
+            "The snapshot will not be replaced."
+        )
+
+    previous_df = previous_df[COLUMNS].fillna("").astype(str)
+    current_df = current_df[COLUMNS].fillna("").astype(str)
+
+    previous_counts = row_counter(previous_df)
+    current_counts = row_counter(current_df)
+
+    changes = []
+
+    # Events appearing more often now are new listings.
+    for row, count in (current_counts - previous_counts).items():
+        for _ in range(count):
+            changes.append({
+                "Change Type": "New",
+                **dict(zip(COLUMNS, row)),
+            })
+
+    # Events appearing less often now are removed listings.
+    for row, count in (previous_counts - current_counts).items():
+        for _ in range(count):
+            changes.append({
+                "Change Type": "Removed",
+                **dict(zip(COLUMNS, row)),
+            })
+
+    changes_df = pd.DataFrame(changes, columns=CHANGE_COLUMNS)
+
+    if not changes_df.empty:
+        changes_df = changes_df.sort_values(
+            by=["Change Type", "Start Date", "Event Name"],
+            kind="stable",
+        ).reset_index(drop=True)
+
+    return changes_df, True
 
 
 # --------------------------------------------------
@@ -159,8 +245,6 @@ def main():
 
     soup = get_soup(SOURCE_URL)
 
-    # Use the listing page itself, rather than relying on individual
-    # event pages to determine which events exist.
     raw_lines = soup.get_text("\n", strip=True).splitlines()
     lines = [clean(line) for line in raw_lines if clean(line)]
 
@@ -170,17 +254,18 @@ def main():
     if not event_names:
         raise RuntimeError(
             "No event links were found on the TCDB listing. "
-            "The website's link format may have changed."
+            "The website may have changed or returned an incomplete page. "
+            "No snapshot will be updated."
         )
 
-    print(f"Found {sum(len(q) for q in links_by_name.values())} event links.")
+    total_links = sum(len(queue) for queue in links_by_name.values())
+    print(f"Found {total_links} event links.")
 
     events = []
     current_date = ""
     matched_links = 0
 
     for index, line in enumerate(lines):
-        # Update the date whenever a new date heading appears.
         listing_date = parse_listing_date(line)
 
         if listing_date:
@@ -189,14 +274,14 @@ def main():
 
         normalized_name = normalize(line)
 
-        # Only process lines matching an actual event link.
         if normalized_name not in links_by_name:
             continue
 
         if not links_by_name[normalized_name]:
             continue
 
-        event_url = links_by_name[normalized_name].popleft()
+        # Consume one matching link for each occurrence of an event name.
+        links_by_name[normalized_name].popleft()
         matched_links += 1
 
         location = get_location(
@@ -205,89 +290,102 @@ def main():
             event_names,
         )
 
-        # The listing groups shows by individual calendar date.
-        # When only one date is available, use it in both date columns.
+        # TCDB groups shows by individual calendar date.
+        # Use the listed date for both date columns.
         events.append({
             "Start Date": current_date,
             "End Date": current_date,
             "Event Name": line,
             "Location and Address": location,
-            "_Event URL": event_url,
         })
 
     if not events:
         raise RuntimeError(
             "The scraper found event links but could not match them "
-            "to the date-grouped listing. No spreadsheet was created."
+            "to the date-grouped listing. No snapshot will be updated."
         )
 
-    # Report any event links that weren't matched to listing text.
-    unmatched = sum(len(q) for q in links_by_name.values())
+    unmatched_links = sum(len(queue) for queue in links_by_name.values())
 
     print(f"Matched {matched_links} event listings.")
 
-    if unmatched:
+    if unmatched_links:
         print(
-            f"Warning: {unmatched} event links were not matched "
-            "to a listing line."
+            f"Warning: {unmatched_links} event links did not match "
+            "a listing line. Review the audit report."
         )
 
-    # Remove only exact duplicate records, not events that share a name.
-    df = pd.DataFrame(events)
-
-    df = df.drop_duplicates(
-        subset=[
-            "Start Date",
-            "End Date",
-            "Event Name",
-            "Location and Address",
-            "_Event URL",
-        ]
-    )
-
-    # Keep the requested four columns, in the requested order.
-    df = df[
-        [
-            "Start Date",
-            "End Date",
-            "Event Name",
-            "Location and Address",
-        ]
-    ]
+    # Remove exact duplicate records while retaining distinct events.
+    df = pd.DataFrame(events, columns=COLUMNS)
+    df = df.drop_duplicates(subset=COLUMNS)
 
     df = df.sort_values(
         by=["Start Date", "Event Name"],
         na_position="last",
         kind="stable",
-    )
+    ).reset_index(drop=True)
+
+    # Compare with the last successful snapshot before replacing it.
+    changes_df, had_baseline = create_change_report(df)
+
+    # --------------------------------------------------
+    # EXPORT CURRENT LISTING AND CHANGE REPORT
+    # --------------------------------------------------
 
     excel_path = OUTPUT / "tcdb_texas_card_shows.xlsx"
     csv_path = OUTPUT / "tcdb_texas_card_shows.csv"
+    changes_excel_path = OUTPUT / "tcdb_daily_changes.xlsx"
+    changes_csv_path = OUTPUT / "tcdb_daily_changes.csv"
     debug_path = OUTPUT / "tcdb_debug.txt"
 
+    # Full current listing.
     df.to_excel(excel_path, index=False)
     df.to_csv(csv_path, index=False)
 
-    # Save a simple audit report so missing matches can be investigated.
+    # Only newly added and removed event listings.
+    changes_df.to_excel(changes_excel_path, index=False)
+    changes_df.to_csv(changes_csv_path, index=False)
+
+    new_count = (
+        int((changes_df["Change Type"] == "New").sum())
+        if not changes_df.empty else 0
+    )
+    removed_count = (
+        int((changes_df["Change Type"] == "Removed").sum())
+        if not changes_df.empty else 0
+    )
+
+    # Write the audit report before updating the snapshot.
     with open(debug_path, "w", encoding="utf-8") as file:
         file.write(f"Source: {SOURCE_URL}\n")
-        file.write(f"Event links found: {matched_links + unmatched}\n")
+        file.write(f"Event links found: {total_links}\n")
         file.write(f"Event listings matched: {matched_links}\n")
-        file.write(f"Unmatched event links: {unmatched}\n")
-        file.write(f"Rows exported: {len(df)}\n\n")
+        file.write(f"Unmatched event links: {unmatched_links}\n")
+        file.write(f"Rows exported: {len(df)}\n")
+        file.write(f"Previous baseline existed: {had_baseline}\n")
+        file.write(f"New listings: {new_count}\n")
+        file.write(f"Removed listings: {removed_count}\n\n")
         file.write("Exported event listings:\n")
 
         for _, row in df.iterrows():
             file.write(
                 f"{row['Start Date']} | "
+                f"{row['End Date']} | "
                 f"{row['Event Name']} | "
                 f"{row['Location and Address']}\n"
             )
 
-    print(f"Exported {len(df)} rows.")
-    print(f"Excel file: {excel_path}")
-    print(f"CSV file: {csv_path}")
+    # Update the baseline only after scraping and report exports succeed.
+    # GitHub Actions must commit this file to preserve it between runs.
+    df[COLUMNS].to_csv(SNAPSHOT_PATH, index=False)
+
+    print(f"Exported {len(df)} current event rows.")
+    print(f"New event listings: {new_count}")
+    print(f"Removed event listings: {removed_count}")
+    print(f"Full Excel listing: {excel_path}")
+    print(f"Daily changes report: {changes_excel_path}")
     print(f"Audit report: {debug_path}")
+    print(f"Comparison snapshot: {SNAPSHOT_PATH}")
 
 
 if __name__ == "__main__":
