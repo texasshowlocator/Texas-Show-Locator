@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 
 
 # ============================================================
-# TEXAS SHOW LOCATOR — EVENT SCRAPER AND CHANGE TRACKER
+# TEXAS SHOW LOCATOR SETTINGS
 # ============================================================
 
 TCDB_URL = (
@@ -52,11 +52,6 @@ CHANGE_COLUMNS = [
     "Source Website",
 ]
 
-MONTHS = (
-    "January|February|March|April|May|June|July|August|"
-    "September|October|November|December"
-)
-
 MONTH_PATTERN = (
     r"(?:January|February|March|April|May|June|July|August|"
     r"September|October|November|December|Jan|Feb|Mar|Apr|"
@@ -72,12 +67,10 @@ session.headers.update(HEADERS)
 # ============================================================
 
 def clean(value):
-    """Normalize whitespace and remove empty/null values."""
     if value is None:
         return ""
 
-    value = str(value)
-    value = value.replace("\xa0", " ")
+    value = str(value).replace("\xa0", " ")
     value = re.sub(r"\s+", " ", value)
 
     if value.strip().lower() in {"none", "null", "nan"}:
@@ -87,7 +80,6 @@ def clean(value):
 
 
 def normalize(value):
-    """Normalize text for comparisons."""
     value = clean(value).lower()
     value = value.replace("&", " and ")
     value = re.sub(r"[^a-z0-9]+", " ", value)
@@ -95,15 +87,12 @@ def normalize(value):
 
 
 def fetch_soup(url):
-    """Download a page and return its BeautifulSoup document."""
     response = session.get(url, timeout=TIMEOUT)
     response.raise_for_status()
-
     return BeautifulSoup(response.text, "html.parser")
 
 
 def parse_date(value):
-    """Convert common date strings to YYYY-MM-DD."""
     if value is None:
         return ""
 
@@ -115,7 +104,6 @@ def parse_date(value):
     if not value:
         return ""
 
-    # Handle ISO timestamps, including timezone suffixes.
     try:
         parsed = pd.to_datetime(value, errors="raise", utc=True)
         return parsed.strftime("%Y-%m-%d")
@@ -145,24 +133,23 @@ def parse_date(value):
 
 
 def parse_month_day(value, default_year=None):
-    """Parse a month/day date, optionally using a supplied year."""
     value = clean(value)
 
     if not value:
         return ""
 
-    value = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", value, flags=re.I)
+    value = re.sub(
+        r"(\d)(st|nd|rd|th)\b",
+        r"\1",
+        value,
+        flags=re.I,
+    )
     value = re.sub(r"\s+", " ", value).strip(" ,")
 
     if default_year is not None and not re.search(r"\b20\d{2}\b", value):
         value = f"{value}, {default_year}"
 
-    parsed = parse_date(value)
-
-    if parsed:
-        return parsed
-
-    return ""
+    return parse_date(value)
 
 
 def make_record(
@@ -172,7 +159,6 @@ def make_record(
     event_location="",
     source="",
 ):
-    """Build a consistently shaped event record."""
     start_date = parse_date(start_date) if start_date else ""
     end_date = parse_date(end_date) if end_date else ""
 
@@ -189,27 +175,24 @@ def make_record(
 
 
 def normalize_event_frame(frame):
-    """Clean, standardize, sort, and deduplicate event records."""
     if frame is None or frame.empty:
         return pd.DataFrame(columns=COLUMNS)
 
     frame = frame.copy()
 
-    # Migrate the old snapshot column name, if present.
+    # Support snapshots created by the earlier version of the scraper.
     if "Location and Address" in frame.columns:
         if "Event Location" not in frame.columns:
             frame = frame.rename(
                 columns={"Location and Address": "Event Location"}
             )
         else:
-            frame["Event Location"] = (
-                frame["Event Location"]
-                .fillna("")
-                .where(
-                    frame["Event Location"].fillna("").astype(str).str.strip()
-                    != "",
-                    frame["Location and Address"],
-                )
+            old_location = frame["Location and Address"].fillna("").astype(str)
+            new_location = frame["Event Location"].fillna("").astype(str)
+
+            frame["Event Location"] = new_location.where(
+                new_location.str.strip() != "",
+                old_location,
             )
 
     for column in COLUMNS:
@@ -224,19 +207,14 @@ def normalize_event_frame(frame):
     frame["Start Date"] = frame["Start Date"].map(parse_date)
     frame["End Date"] = frame["End Date"].map(parse_date)
 
-    # A missing end date defaults to the start date.
-    frame.loc[
-        frame["End Date"] == "", "End Date"
-    ] = frame.loc[
-        frame["End Date"] == "", "Start Date"
-    ]
+    blank_end = frame["End Date"] == ""
+    frame.loc[blank_end, "End Date"] = frame.loc[blank_end, "Start Date"]
 
     frame = frame[
         (frame["Event Name"] != "")
         & (frame["Start Date"] != "")
     ].copy()
 
-    # Remove exact duplicates without merging different sources.
     frame["_dedupe"] = frame.apply(
         lambda row: (
             normalize(row["Start Date"]),
@@ -257,7 +235,6 @@ def normalize_event_frame(frame):
 
 
 def event_key(row):
-    """Comparison key for identifying the same event across snapshots."""
     return (
         normalize(row.get("Start Date", "")),
         normalize(row.get("Event Name", "")),
@@ -266,7 +243,6 @@ def event_key(row):
 
 
 def row_counter(frame):
-    """Create a multiset of event keys."""
     return Counter(event_key(row) for _, row in frame.iterrows())
 
 
@@ -275,14 +251,11 @@ def row_counter(frame):
 # ============================================================
 
 def extract_tcdb_date(text):
-    """
-    Find a full date in TCDB page text.
-    Returns YYYY-MM-DD or an empty string.
-    """
     text = clean(text)
 
     patterns = [
-        rf"\b({MONTH_PATTERN})\.?\s+\d{{1,2}}(?:st|nd|rd|th)?"
+        rf"\b({MONTH_PATTERN})\.?\s+\d{{1,2}}"
+        rf"(?:st|nd|rd|th)?"
         rf"(?:\s*[-–—]\s*\d{{1,2}}(?:st|nd|rd|th)?)?"
         rf",?\s+20\d{{2}}\b",
         r"\b\d{1,2}/\d{1,2}/20\d{2}\b",
@@ -291,38 +264,37 @@ def extract_tcdb_date(text):
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.I)
 
-        if match:
-            found = match.group(0)
-            found = re.sub(
-                r"(\d)(st|nd|rd|th)\b",
-                r"\1",
-                found,
-                flags=re.I,
+        if not match:
+            continue
+
+        found = re.sub(
+            r"(\d)(st|nd|rd|th)\b",
+            r"\1",
+            match.group(0),
+            flags=re.I,
+        )
+
+        range_match = re.match(
+            rf"({MONTH_PATTERN}\.?\s+\d{{1,2}})"
+            rf"\s*[-–—]\s*\d{{1,2}},?\s+(20\d{{2}})",
+            found,
+            flags=re.I,
+        )
+
+        if range_match:
+            return parse_month_day(
+                f"{range_match.group(1)}, {range_match.group(2)}"
             )
 
-            # If a date range is present, the first date is the start.
-            range_match = re.match(
-                rf"({MONTH_PATTERN}\.?\s+\d{{1,2}})"
-                rf"\s*[-–—]\s*\d{{1,2}},?\s+(20\d{{2}})",
-                found,
-                flags=re.I,
-            )
+        parsed = parse_date(found)
 
-            if range_match:
-                return parse_month_day(
-                    f"{range_match.group(1)}, {range_match.group(2)}"
-                )
-
-            parsed = parse_date(found)
-
-            if parsed:
-                return parsed
+        if parsed:
+            return parsed
 
     return ""
 
 
 def tcdb_location_from_text(text):
-    """Extract a likely Texas venue/location line from listing text."""
     lines = [
         clean(line)
         for line in text.splitlines()
@@ -330,51 +302,31 @@ def tcdb_location_from_text(text):
     ]
 
     for line in lines:
-        if re.search(r"\bTX\b", line, flags=re.I):
-            if len(line) <= 250:
-                return line
+        if re.search(r"\bTX\b", line, flags=re.I) and len(line) <= 250:
+            return line
 
-    # Try city, Texas wording when the abbreviation isn't present.
     for line in lines:
-        if re.search(r"\bTexas\b", line, flags=re.I):
-            if len(line) <= 250:
-                return line
+        if re.search(r"\bTexas\b", line, flags=re.I) and len(line) <= 250:
+            return line
 
     return ""
 
 
 def scrape_tcdb():
-    """
-    Scrape TCDB's Texas card-show listing.
-
-    This parser deliberately uses multiple HTML patterns because the
-    listing's markup may change. It does not treat an empty result as
-    a successful scrape.
-    """
     soup = fetch_soup(TCDB_URL)
     records = []
-
-    # Inspect links that look like individual TCDB card show pages.
     event_links = []
 
     for anchor in soup.find_all("a", href=True):
-        href = anchor["href"]
-        full_url = urljoin(TCDB_URL, href)
+        full_url = urljoin(TCDB_URL, anchor["href"])
         parsed = urlparse(full_url)
 
-        if parsed.netloc.lower() not in {
-            "tcdb.com",
-            "www.tcdb.com",
-        }:
+        if parsed.netloc.lower() not in {"tcdb.com", "www.tcdb.com"}:
             continue
 
         if "CardShows.cfm" not in parsed.path:
             continue
 
-        if full_url.split("#")[0] == TCDB_URL:
-            continue
-
-        # Individual card show pages commonly contain an ID parameter.
         if not re.search(r"(?:^|&)ID=\d+", parsed.query, flags=re.I):
             continue
 
@@ -391,7 +343,6 @@ def scrape_tcdb():
 
         seen_urls.add(url)
 
-        # Use nearby listing markup to get dates and location.
         container = anchor
 
         for _ in range(5):
@@ -399,23 +350,14 @@ def scrape_tcdb():
                 break
 
             container = container.parent
-            container_text = clean(
-                container.get_text(" ", strip=True)
-            )
+            container_text = clean(container.get_text(" ", strip=True))
 
-            if (
-                extract_tcdb_date(container_text)
-                and len(container_text) < 2500
-            ):
+            if extract_tcdb_date(container_text) and len(container_text) < 2500:
                 break
 
         container_text = container.get_text("\n", strip=True)
-
         start_date = extract_tcdb_date(container_text)
         location = tcdb_location_from_text(container_text)
-
-        # Try the event detail page if the listing container lacks details.
-        detail_soup = None
 
         if not start_date or not location:
             try:
@@ -429,16 +371,13 @@ def scrape_tcdb():
                     location = tcdb_location_from_text(detail_text)
 
                 if not link_title:
-                    title_tag = detail_soup.find("h1") or detail_soup.title
-                    if title_tag:
-                        link_title = clean(
-                            title_tag.get_text(" ", strip=True)
-                        )
+                    heading = detail_soup.find("h1") or detail_soup.title
+                    if heading:
+                        link_title = clean(heading.get_text(" ", strip=True))
+
             except requests.RequestException as exc:
                 print(f"TCDB detail-page warning: {url}: {exc}")
 
-        # Skip entries that do not have enough information to identify
-        # a dated event.
         if not start_date or not link_title:
             continue
 
@@ -452,67 +391,55 @@ def scrape_tcdb():
             )
         )
 
-    # Some TCDB pages expose their events as text rather than individual
-    # links. Use a fallback parser for date-headed listing sections.
+    # Fallback if TCDB exposes its events as text rather than event links.
     if not records:
-        text = soup.get_text("\n", strip=True)
-        lines = [clean(line) for line in text.splitlines()]
+        lines = [
+            clean(line)
+            for line in soup.get_text("\n", strip=True).splitlines()
+        ]
         lines = [line for line in lines if line]
-
-        current_date = ""
-        current_event = ""
 
         for index, line in enumerate(lines):
             found_date = extract_tcdb_date(line)
 
-            if found_date:
-                current_date = found_date
-                current_event = ""
+            if not found_date:
                 continue
 
-            if not current_date:
-                continue
+            for candidate in lines[index + 1:index + 5]:
+                if (
+                    len(candidate) >= 4
+                    and len(candidate) <= 180
+                    and not re.search(
+                        r"^(home|login|register|search|next|previous|"
+                        r"calendar|card shows|contact|about)$",
+                        candidate,
+                        re.I,
+                    )
+                ):
+                    location = ""
 
-            # Candidate event names should not be navigation labels.
-            if (
-                len(line) >= 4
-                and len(line) <= 180
-                and not re.search(
-                    r"^(home|login|register|search|next|previous|"
-                    r"calendar|card shows|contact|about)$",
-                    line,
-                    flags=re.I,
-                )
-            ):
-                current_event = line
+                    for next_line in lines[index + 1:index + 8]:
+                        if re.search(r"\b(?:TX|Texas)\b", next_line, re.I):
+                            location = next_line
+                            break
 
-                location = ""
-
-                for next_line in lines[index + 1:index + 5]:
-                    if re.search(r"\b(?:TX|Texas)\b", next_line, re.I):
-                        location = next_line
-                        break
-
-                if current_event:
                     records.append(
                         make_record(
-                            start_date=current_date,
-                            end_date=current_date,
-                            event_name=current_event,
+                            start_date=found_date,
+                            end_date=found_date,
+                            event_name=candidate,
                             event_location=location,
                             source="TCDB",
                         )
                     )
-                    current_date = ""
-                    current_event = ""
+                    break
 
     result = normalize_event_frame(pd.DataFrame(records, columns=COLUMNS))
 
     if result.empty:
         raise RuntimeError(
-            "TCDB returned no usable events. The page may have changed "
-            "or its listing format may need an update. The previous "
-            "snapshot will not be replaced."
+            "TCDB returned no usable events. The page may have changed. "
+            "The previous snapshot will not be replaced."
         )
 
     return result
@@ -524,20 +451,23 @@ def scrape_tcdb():
 
 def get_event_links(soup):
     """
-    Collect unique Texas event detail URLs from OnTreasure.
+    Collect unique Texas event URLs and their city from the listing.
 
-    The Texas events page may display featured events outside Texas.
-    This filter only accepts event links whose visible link text
-    explicitly contains a Texas location, such as 'Houston, TX'.
+    The location is extracted from the event link and nearby card text.
+    This helps when a detail page doesn't expose a venue address.
     """
     links = []
     seen = set()
+
+    location_pattern = re.compile(
+        r"\b([A-Za-z][A-Za-z .'-]*,\s*TX)\b",
+        re.IGNORECASE,
+    )
 
     for anchor in soup.find_all("a", href=True):
         url = urljoin(ONTREASURE_URL, anchor["href"])
         parsed = urlparse(url)
         path = parsed.path.rstrip("/")
-        link_text = clean(anchor.get_text(" ", strip=True))
 
         if parsed.netloc.lower() not in (
             "ontreasure.com",
@@ -545,25 +475,38 @@ def get_event_links(soup):
         ):
             continue
 
-        if not path.startswith("/events/"):
+        if not path.startswith("/events/") or path.endswith("/tickets"):
             continue
 
-        if path.endswith("/tickets"):
+        # Look at the anchor and its surrounding event card.
+        context_parts = []
+        node = anchor
+
+        for _ in range(4):
+            if node is None:
+                break
+
+            context_parts.append(node.get_text(" ", strip=True))
+            node = node.parent
+
+        context = " ".join(context_parts)
+        match = location_pattern.search(context)
+
+        # Do not accept events unless a Texas city is visible.
+        if not match:
             continue
 
-        # Exclude featured events unless their link text identifies Texas.
-        if not re.search(r",\s*TX\b", link_text, re.IGNORECASE):
-            continue
+        city = clean(match.group(1))
+        city = re.sub(r"\s+", " ", city)
 
         if url not in seen:
             seen.add(url)
-            links.append(url)
+            links.append((url, city))
 
     return links
 
 
 def jsonld_objects(soup):
-    """Return JSON-LD objects, including objects nested in @graph."""
     objects = []
 
     for script in soup.find_all(
@@ -582,10 +525,12 @@ def jsonld_objects(soup):
 
         if isinstance(data, list):
             objects.extend(data)
+
         elif isinstance(data, dict):
             objects.append(data)
 
             graph = data.get("@graph", [])
+
             if isinstance(graph, list):
                 objects.extend(
                     item for item in graph if isinstance(item, dict)
@@ -595,14 +540,13 @@ def jsonld_objects(soup):
 
 
 def find_jsonld_events(soup):
-    """Find Event objects from JSON-LD data."""
     events = []
 
     for item in jsonld_objects(soup):
         item_type = item.get("@type", "")
 
         if isinstance(item_type, list):
-            item_type = " ".join(str(x) for x in item_type)
+            item_type = " ".join(str(value) for value in item_type)
 
         if re.search(r"\bEvent\b", str(item_type), re.I):
             events.append(item)
@@ -610,16 +554,7 @@ def find_jsonld_events(soup):
     return events
 
 
-def get_nested_name(value):
-    """Extract a name from a JSON-LD name or object."""
-    if isinstance(value, dict):
-        return clean(value.get("name", ""))
-
-    return clean(value)
-
-
 def get_jsonld_location(event):
-    """Extract a venue and city/state from a JSON-LD event."""
     location = event.get("location", "")
 
     if isinstance(location, list):
@@ -646,7 +581,6 @@ def get_jsonld_location(event):
 
 
 def is_texas_location(location):
-    """Check whether a location clearly identifies Texas."""
     location = clean(location)
 
     return bool(
@@ -654,8 +588,79 @@ def is_texas_location(location):
     )
 
 
-def parse_event_detail(url):
-    """Extract event details from an OnTreasure event page."""
+def parse_date_range(text):
+    text = clean(text)
+
+    # Example: October 31-November 1, 2026.
+    match = re.search(
+        rf"\b({MONTH_PATTERN})\.?\s+(\d{{1,2}})"
+        rf"(?:st|nd|rd|th)?\s*[-–—]\s*"
+        rf"({MONTH_PATTERN})\.?\s+(\d{{1,2}})"
+        rf"(?:st|nd|rd|th)?,?\s+(20\d{{2}})\b",
+        text,
+        re.I,
+    )
+
+    if match:
+        month1, day1, month2, day2, year = match.groups()
+
+        start = parse_month_day(f"{month1} {day1}, {year}")
+        end = parse_month_day(f"{month2} {day2}, {year}")
+
+        if start:
+            return start, end or start
+
+    # Example: October 31-November 1, 2026, with year only at end.
+    match = re.search(
+        rf"\b({MONTH_PATTERN})\.?\s+(\d{{1,2}})"
+        rf"(?:st|nd|rd|th)?\s*[-–—]\s*(\d{{1,2}})"
+        rf"(?:st|nd|rd|th)?,?\s+(20\d{{2}})\b",
+        text,
+        re.I,
+    )
+
+    if match:
+        month, day1, day2, year = match.groups()
+
+        start = parse_month_day(f"{month} {day1}, {year}")
+        end = parse_month_day(f"{month} {day2}, {year}")
+
+        if start:
+            return start, end or start
+
+    # Example: October 31, 2026.
+    match = re.search(
+        rf"\b{MONTH_PATTERN}\.?\s+\d{{1,2}}"
+        rf"(?:st|nd|rd|th)?,?\s+20\d{{2}}\b",
+        text,
+        re.I,
+    )
+
+    if match:
+        found = re.sub(
+            r"(\d)(st|nd|rd|th)\b",
+            r"\1",
+            match.group(0),
+            flags=re.I,
+        )
+        parsed = parse_date(found)
+
+        if parsed:
+            return parsed, parsed
+
+    # ISO date fallback.
+    match = re.search(r"\b20\d{2}-\d{2}-\d{2}\b", text)
+
+    if match:
+        parsed = parse_date(match.group(0))
+
+        if parsed:
+            return parsed, parsed
+
+    return "", ""
+
+
+def parse_event_detail(url, listing_location=""):
     soup = fetch_soup(url)
     event_objects = find_jsonld_events(soup)
 
@@ -664,7 +669,7 @@ def parse_event_detail(url):
     end_date = ""
     location = ""
 
-    # Prefer structured event data.
+    # Prefer structured data when available.
     for event in event_objects:
         if not title:
             title = clean(event.get("name", ""))
@@ -678,7 +683,7 @@ def parse_event_detail(url):
         if not location:
             location = get_jsonld_location(event)
 
-    # Page heading fallback.
+    # Fall back to the visible heading.
     if not title:
         heading = soup.find("h1")
 
@@ -690,12 +695,12 @@ def parse_event_detail(url):
 
     page_text = soup.get_text("\n", strip=True)
 
-    # Try to locate dates in visible page text if JSON-LD lacks them.
+    # Extract dates from the visible page if structured dates are absent.
     if not start_date:
         start_date, end_date = parse_date_range(page_text)
 
-    # Location fallback: find a city/state line in the page text.
-    if not location:
+    # Try to find a Texas location in the detail page.
+    if not is_texas_location(location):
         for line in page_text.splitlines():
             line = clean(line)
 
@@ -703,7 +708,10 @@ def parse_event_detail(url):
                 location = line
                 break
 
-    # Keep Texas-only events.
+    # Fallback to the Texas city identified on the listing page.
+    if not is_texas_location(location) and is_texas_location(listing_location):
+        location = listing_location
+
     if not is_texas_location(location):
         raise ValueError(
             f"Could not verify a Texas location for OnTreasure event: "
@@ -733,112 +741,44 @@ def parse_event_detail(url):
     )
 
 
-def parse_date_range(text):
-    """
-    Find a date or date range in visible text.
-    Returns (start_date, end_date).
-    """
-    text = clean(text)
-
-    # Month Day-Day, Year, e.g. October 10-11, 2026.
-    range_patterns = [
-        rf"\b({MONTH_PATTERN})\.?\s+(\d{{1,2}})"
-        rf"(?:st|nd|rd|th)?\s*[-–—]\s*(\d{{1,2}})"
-        rf"(?:st|nd|rd|th)?,?\s+(20\d{{2}})\b",
-
-        rf"\b({MONTH_PATTERN})\.?\s+(\d{{1,2}})"
-        rf"(?:st|nd|rd|th)?,?\s+(20\d{{2}})"
-        rf"\s*(?:to|through|[-–—])\s*"
-        rf"({MONTH_PATTERN})\.?\s+(\d{{1,2}})"
-        rf"(?:st|nd|rd|th)?,?\s+(20\d{{2}})\b",
-    ]
-
-    match = re.search(range_patterns[0], text, re.I)
-
-    if match:
-        month, first_day, last_day, year = match.groups()
-        start = parse_month_day(f"{month} {first_day}, {year}")
-        end = parse_month_day(f"{month} {last_day}, {year}")
-
-        if start:
-            return start, end or start
-
-    match = re.search(range_patterns[1], text, re.I)
-
-    if match:
-        month1, day1, year1, month2, day2, year2 = match.groups()
-        start = parse_month_day(f"{month1} {day1}, {year1}")
-        end = parse_month_day(f"{month2} {day2}, {year2}")
-
-        if start:
-            return start, end or start
-
-    # Single full date.
-    match = re.search(
-        rf"\b{MONTH_PATTERN}\.?\s+\d{{1,2}}"
-        rf"(?:st|nd|rd|th)?,?\s+20\d{{2}}\b",
-        text,
-        re.I,
-    )
-
-    if match:
-        found = re.sub(
-            r"(\d)(st|nd|rd|th)\b",
-            r"\1",
-            match.group(0),
-            flags=re.I,
-        )
-        parsed = parse_date(found)
-
-        if parsed:
-            return parsed, parsed
-
-    # ISO date.
-    match = re.search(r"\b20\d{2}-\d{2}-\d{2}\b", text)
-
-    if match:
-        parsed = parse_date(match.group(0))
-
-        if parsed:
-            return parsed, parsed
-
-    return "", ""
-
-
 def scrape_ontreasure():
-    """Scrape Texas events from OnTreasure."""
     soup = fetch_soup(ONTREASURE_URL)
-    event_urls = get_event_links(soup)
+    event_links = get_event_links(soup)
 
-    if not event_urls:
+    if not event_links:
         raise RuntimeError(
             "No Texas event links were found on OnTreasure. "
-            "The listing markup may have changed, or the Texas location "
-            "may not appear in the link text. The previous snapshot "
-            "will not be replaced."
+            "The listing layout may have changed, or the city may not "
+            "appear in the event card. The previous snapshot will not "
+            "be replaced."
         )
 
     records = []
     errors = []
 
-    for url in event_urls:
+    for url, listing_location in event_links:
         try:
-            record = parse_event_detail(url)
+            record = parse_event_detail(url, listing_location)
             records.append(record)
-            print(f"OnTreasure OK: {record['Event Name']}")
+
+            print(
+                f"OnTreasure OK: {record['Event Name']} "
+                f"({record['Event Location']})"
+            )
+
         except Exception as exc:
             errors.append(f"{url}: {exc}")
             print(f"OnTreasure warning: {url}: {exc}")
 
-    # Fail the source if any discovered event couldn't be parsed.
-    # This prevents a partial scrape from falsely reporting removals.
+    # Fail closed rather than treating a partial scrape as removals.
     if errors:
         error_summary = "\n".join(errors[:10])
+
         raise RuntimeError(
-            f"OnTreasure found {len(event_urls)} event links, but "
+            f"OnTreasure found {len(event_links)} event links, but "
             f"{len(errors)} could not be verified or parsed. "
-            f"To avoid false removals, the previous snapshot will "
-            f"not be replaced.\n{error_summary}"
+            f"The previous snapshot will not be replaced.\n"
+            f"{error_summary}"
         )
 
     result = normalize_event_frame(pd.DataFrame(records, columns=COLUMNS))
@@ -857,7 +797,6 @@ def scrape_ontreasure():
 # ============================================================
 
 def load_previous_snapshot():
-    """Load the last successful combined event snapshot."""
     if not SNAPSHOT_FILE.exists():
         return pd.DataFrame(columns=COLUMNS)
 
@@ -872,11 +811,8 @@ def load_previous_snapshot():
 
 def compare_snapshots(previous, current):
     """
-    Compare snapshots by start date, event name, and location.
-
-    End dates are included in the report but not used as the primary
-    identity key, so a changed end date doesn't automatically create
-    a removal plus a new event.
+    Compare events by start date, event name, and location.
+    End dates are reported but do not define event identity.
     """
     changes = []
 
@@ -894,23 +830,17 @@ def compare_snapshots(previous, current):
         key = event_key(row)
         new_rows.setdefault(key, []).append(row.to_dict())
 
-    all_keys = set(old_counts) | set(new_counts)
-
-    for key in all_keys:
+    for key in set(old_counts) | set(new_counts):
         old_count = old_counts.get(key, 0)
         new_count = new_counts.get(key, 0)
 
         if new_count > old_count:
             for row in new_rows[key][old_count:new_count]:
-                changes.append(
-                    {"Change Type": "NEW", **row}
-                )
+                changes.append({"Change Type": "NEW", **row})
 
         elif old_count > new_count:
             for row in old_rows[key][new_count:old_count]:
-                changes.append(
-                    {"Change Type": "REMOVED", **row}
-                )
+                changes.append({"Change Type": "REMOVED", **row})
 
     if not changes:
         return pd.DataFrame(columns=CHANGE_COLUMNS)
@@ -932,18 +862,15 @@ def compare_snapshots(previous, current):
 # ============================================================
 
 def write_audit(lines):
-    """Save a plain-text run audit."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    audit_file = OUTPUT_DIR / "scrape_audit.txt"
-    audit_file.write_text(
+    (OUTPUT_DIR / "scrape_audit.txt").write_text(
         "\n".join(lines) + "\n",
         encoding="utf-8",
     )
 
 
 def save_outputs(current, changes, audit_lines):
-    """Write the combined list, change report, and audit file."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     current.to_csv(
@@ -983,7 +910,6 @@ def save_outputs(current, changes, audit_lines):
 
 
 def save_snapshot(current):
-    """Persist the combined snapshot only after both sources succeed."""
     SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     current.to_csv(
@@ -994,7 +920,7 @@ def save_snapshot(current):
 
 
 # ============================================================
-# MAIN
+# MAIN WORKFLOW
 # ============================================================
 
 def main():
@@ -1012,7 +938,7 @@ def main():
     print("TEXAS SHOW LOCATOR — DAILY EVENT SCRAPER")
     print("=" * 65)
 
-    # Preserve the last successful snapshot if either source fails.
+    # Do not update the previous snapshot if either source fails.
     try:
         print("\nScraping TCDB...")
         tcdb_events = scrape_tcdb()
@@ -1029,22 +955,22 @@ def main():
         audit_lines.extend([
             message,
             "",
-            "Snapshot was not replaced because one or more sources failed.",
-            f"Run ended: {datetime.now().astimezone().isoformat(timespec='seconds')}",
+            "Snapshot was not replaced because a source failed.",
+            (
+                "Run ended: "
+                f"{datetime.now().astimezone().isoformat(timespec='seconds')}"
+            ),
         ])
 
         write_audit(audit_lines)
         sys.exit(1)
 
-    # Combine both sources. Same event from different sources is retained
-    # because the source column helps with verification and attribution.
     combined = pd.concat(
         [tcdb_events, ontreasure_events],
         ignore_index=True,
     )
 
     combined = normalize_event_frame(combined)
-
     previous = load_previous_snapshot()
     is_first_run = previous.empty
 
@@ -1052,10 +978,20 @@ def main():
         changes = pd.DataFrame(columns=CHANGE_COLUMNS)
         audit_lines.append(
             "First successful run: no prior snapshot was available. "
-            "All collected events are treated as the baseline."
+            "This run establishes the baseline."
         )
     else:
         changes = compare_snapshots(previous, combined)
+
+    new_count = (
+        int((changes["Change Type"] == "NEW").sum())
+        if not changes.empty else 0
+    )
+
+    removed_count = (
+        int((changes["Change Type"] == "REMOVED").sum())
+        if not changes.empty else 0
+    )
 
     audit_lines.extend([
         "",
@@ -1063,15 +999,18 @@ def main():
         f"OnTreasure event count: {len(ontreasure_events)}",
         f"Combined event count: {len(combined)}",
         f"Previous snapshot event count: {len(previous)}",
-        f"New event records: {int((changes['Change Type'] == 'NEW').sum()) if not changes.empty else 0}",
-        f"Removed event records: {int((changes['Change Type'] == 'REMOVED').sum()) if not changes.empty else 0}",
+        f"New event records: {new_count}",
+        f"Removed event records: {removed_count}",
         "",
         "Source status: SUCCESS",
-        "Snapshot updated only after both sources completed successfully.",
-        f"Run ended: {datetime.now().astimezone().isoformat(timespec='seconds')}",
+        "Snapshot updated after both sources completed successfully.",
+        (
+            "Run ended: "
+            f"{datetime.now().astimezone().isoformat(timespec='seconds')}"
+        ),
     ])
 
-    # Write reports first, then update the persistent snapshot.
+    # Save reports first and update the persistent snapshot last.
     save_outputs(combined, changes, audit_lines)
     save_snapshot(combined)
 
@@ -1085,15 +1024,6 @@ def main():
     if is_first_run:
         print("First successful run: baseline snapshot created.")
     else:
-        new_count = (
-            int((changes["Change Type"] == "NEW").sum())
-            if not changes.empty else 0
-        )
-        removed_count = (
-            int((changes["Change Type"] == "REMOVED").sum())
-            if not changes.empty else 0
-        )
-
         print(f"New events: {new_count}")
         print(f"Removed events: {removed_count}")
 
