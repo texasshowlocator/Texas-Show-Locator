@@ -1,83 +1,219 @@
-def scrape_event(url):
-    soup = get_soup(url)
-    text = soup.get_text("\n", strip=True)
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+import re
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urljoin
 
-    heading = soup.find(["h1", "h2", "h3"])
-    event_name = (
-        heading.get_text(" ", strip=True)
-        if heading else "Unknown Event"
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+
+
+# --------------------------------------------------
+# SETTINGS
+# --------------------------------------------------
+
+SOURCE_URL = (
+    "https://www.tcdb.com/CardShows.cfm"
+    "?MODE=Location&State=TX&Display=Texas"
+    "&Country=United%20States"
+)
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; TexasShowLocator/1.0)"
+}
+
+OUTPUT = Path("output")
+OUTPUT.mkdir(exist_ok=True)
+
+
+# --------------------------------------------------
+# HELPER FUNCTIONS
+# --------------------------------------------------
+
+def clean(value):
+    """Remove extra spaces and clean text."""
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def get_soup(url):
+    """Download a webpage and turn it into searchable HTML."""
+    response = requests.get(url, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    return BeautifulSoup(response.text, "html.parser")
+
+
+def parse_date(value):
+    """Convert a recognizable date into YYYY-MM-DD."""
+    value = clean(value)
+
+    formats = [
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%B %d, %Y",
+        "%b %d, %Y",
+        "%B %d %Y",
+        "%b %d %Y",
+        "%m/%d",
+    ]
+
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(value, fmt)
+
+            # If the year is missing, use the current year.
+            if "%Y" not in fmt and "%y" not in fmt:
+                parsed = parsed.replace(year=datetime.now().year)
+
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    return None
+
+
+def extract_date_range(text):
+    """
+    Find a start date and optional end date in event text.
+
+    Examples:
+    11/14/2026
+    11/14/2026 - 11/15/2026
+    November 14-15, 2026
+    """
+    text = clean(text)
+
+    # Numeric date range, such as 11/14/2026 - 11/15/2026
+    match = re.search(
+        r"(\d{1,2}/\d{1,2}/\d{2,4})\s*"
+        r"(?:-|–|—|to)\s*"
+        r"(\d{1,2}/\d{1,2}/\d{2,4})",
+        text,
+        re.IGNORECASE,
     )
 
-    # Find the primary date listed for this event.
-    date_match = DATE_RE.search(text)
-    start_date = ""
-    end_date = ""
+    if match:
+        start_date = parse_date(match.group(1))
+        end_date = parse_date(match.group(2))
+        if start_date:
+            return start_date, end_date or start_date
 
-    if date_match:
-        start_date = datetime.strptime(
-            date_match.group(2), "%B %d, %Y"
-        ).date()
-        end_date = start_date
+    # Single numeric date
+    match = re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", text)
+    if match:
+        start_date = parse_date(match.group(0))
+        if start_date:
+            return start_date, start_date
 
-        # Look for a date range such as July 4-5, 2026.
-        range_pattern = re.compile(
-            r"\b(January|February|March|April|May|June|"
-            r"July|August|September|October|November|December)"
-            r"\s+(\d{1,2})\s*[-–]\s*(\d{1,2}),?\s+(\d{4})\b",
-            re.IGNORECASE,
-        )
+    # Month-name date range, such as November 14-15, 2026
+    match = re.search(
+        r"\b([A-Za-z]+)\s+(\d{1,2})\s*"
+        r"(?:-|–|—|to)\s*(\d{1,2}),?\s+(\d{4})\b",
+        text,
+    )
 
-        for match in range_pattern.finditer(text):
-            month, first_day, last_day, year = match.groups()
+    if match:
+        month, start_day, end_day, year = match.groups()
+        start_date = parse_date(f"{month} {start_day}, {year}")
+        end_date = parse_date(f"{month} {end_day}, {year}")
 
-            try:
-                range_start = datetime.strptime(
-                    f"{month} {first_day} {year}", "%B %d %Y"
-                ).date()
+        if start_date:
+            return start_date, end_date or start_date
 
-                range_end = datetime.strptime(
-                    f"{month} {last_day} {year}", "%B %d %Y"
-                ).date()
+    # Single month-name date
+    match = re.search(
+        r"\b[A-Za-z]+\s+\d{1,2},?\s+\d{4}\b",
+        text,
+    )
 
-                # Only accept a range that begins on the event's
-                # primary date, avoiding unrelated dates in notes.
-                if range_start == start_date and range_end >= range_start:
-                    end_date = range_end
-                    break
-            except ValueError:
-                continue
+    if match:
+        start_date = parse_date(match.group(0))
+        if start_date:
+            return start_date, start_date
 
-    city = ""
-    venue = ""
+    return None, None
 
-    for i, line in enumerate(lines):
-        if re.search(r",\s*TX(?:\s|$)", line, re.IGNORECASE):
-            city = re.sub(
-                r",\s*TX.*$", "", line, flags=re.IGNORECASE
-            ).strip()
 
-            if i >= 1:
-                venue = lines[i - 1]
-            break
+def scrape_event(url):
+    """Read an individual event page and extract available details."""
+    soup = get_soup(url)
 
-    review = []
+    page_text = clean(soup.get_text(" ", strip=True))
+    title = clean(soup.title.get_text()) if soup.title else ""
 
-    if not start_date:
-        review.append("Start date not found")
-    if not venue:
-        review.append("Venue not detected")
-    if not city:
-        review.append("City not detected")
+    start_date, end_date = extract_date_range(page_text)
 
     return {
-        "Start Date": start_date,
-        "End Date": end_date,
-        "Event Name": event_name,
-        "Venue": venue,
-        "City": city,
-        "State": "TX",
-        "Source Website": "TCDB",
+        "Event Name": title,
+        "Start Date": start_date or "",
+        "End Date": end_date or start_date or "",
         "Event URL": url,
-        "Review Needed": "; ".join(review),
+        "Page Text": page_text,
     }
+
+
+# --------------------------------------------------
+# MAIN SCRAPER
+# --------------------------------------------------
+
+def main():
+    print("Opening the TCDB Texas card show listing...")
+
+    soup = get_soup(SOURCE_URL)
+    events = []
+
+    # Find links to individual card show pages.
+    for link in soup.find_all("a", href=True):
+        event_name = clean(link.get_text(" ", strip=True))
+        event_url = urljoin(SOURCE_URL, link["href"])
+
+        if not event_name:
+            continue
+
+        if "CardShows.cfm" not in event_url:
+            continue
+
+        if event_url.rstrip("/") == SOURCE_URL.rstrip("/"):
+            continue
+
+        try:
+            details = scrape_event(event_url)
+        except requests.RequestException as error:
+            print(f"Could not read {event_url}: {error}")
+            continue
+
+        # Prefer the link text for the event name when available.
+        details["Event Name"] = event_name or details["Event Name"]
+        details["Source Website"] = "TCDB"
+
+        events.append(details)
+
+    # Remove duplicate links.
+    unique_events = []
+    seen_urls = set()
+
+    for event in events:
+        if event["Event URL"] not in seen_urls:
+            seen_urls.add(event["Event URL"])
+            unique_events.append(event)
+
+    if not unique_events:
+        raise RuntimeError(
+            "No events were found. The TCDB page may have changed "
+            "or its event links may need a different extraction method."
+        )
+
+    df = pd.DataFrame(unique_events)
+
+    csv_path = OUTPUT / "tcdb_texas_card_shows.csv"
+    xlsx_path = OUTPUT / "tcdb_texas_card_shows.xlsx"
+
+    df.to_csv(csv_path, index=False)
+    df.to_excel(xlsx_path, index=False)
+
+    print(f"Found {len(df)} event links.")
+    print(f"CSV saved to: {csv_path}")
+    print(f"Excel saved to: {xlsx_path}")
+
+
+if __name__ == "__main__":
+    main()
