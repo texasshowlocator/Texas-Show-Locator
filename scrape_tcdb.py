@@ -3,7 +3,7 @@ import json
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -52,7 +52,7 @@ HEADERS = {
 
 REQUEST_TIMEOUT = 45
 
-# Increased delay to reduce the likelihood of HTTP 429 errors.
+# Delay between event detail-page requests.
 REQUEST_DELAY = 1.5
 
 # Retry temporary server errors and rate limits.
@@ -113,6 +113,7 @@ def parse_date(value):
 
     value = clean_text(value)
 
+    # Handle ISO dates, including timezone suffixes.
     try:
         return datetime.fromisoformat(
             value.replace("Z", "+00:00")
@@ -183,6 +184,83 @@ def event_key(event):
 
 
 # ============================================================
+# MERGE CONSECUTIVE EVENT DATES
+# ============================================================
+
+def merge_consecutive_events(events):
+    """
+    Combine consecutive or overlapping event dates into
+    one row when event name and venue/address match.
+
+    Example:
+        11/06/26 - 11/06/26
+        11/07/26 - 11/07/26
+        11/08/26 - 11/08/26
+
+    Becomes:
+        11/06/26 - 11/08/26
+
+    Separate date ranges remain separate when there is
+    at least one full day between them.
+    """
+
+    grouped = {}
+
+    for event in events:
+        group_key = (
+            clean_text(event["Event"]).casefold(),
+            clean_text(event["Venue/Address"]).casefold(),
+        )
+
+        grouped.setdefault(group_key, []).append(event.copy())
+
+    merged = []
+
+    for group_events in grouped.values():
+
+        group_events.sort(
+            key=lambda item: datetime.strptime(
+                item["Start"], "%m/%d/%y"
+            )
+        )
+
+        current = None
+
+        for event in group_events:
+
+            event_start = datetime.strptime(
+                event["Start"], "%m/%d/%y"
+            )
+
+            event_end = datetime.strptime(
+                event["End"], "%m/%d/%y"
+            )
+
+            if current is None:
+                current = event.copy()
+                continue
+
+            current_end = datetime.strptime(
+                current["End"], "%m/%d/%y"
+            )
+
+            # Merge overlapping or immediately consecutive dates.
+            if event_start <= current_end + timedelta(days=1):
+
+                if event_end > current_end:
+                    current["End"] = event_end.strftime("%m/%d/%y")
+
+            else:
+                merged.append(current)
+                current = event.copy()
+
+        if current is not None:
+            merged.append(current)
+
+    return merged
+
+
+# ============================================================
 # JSON-LD EXTRACTION
 # ============================================================
 
@@ -227,6 +305,7 @@ def extract_jsonld_event(soup):
     Return the most useful Event object and its location.
     """
     for obj in get_jsonld_objects(soup):
+
         event_type = obj.get("@type", "")
 
         if isinstance(event_type, list):
@@ -253,8 +332,10 @@ def extract_jsonld_event(soup):
         if isinstance(address, str):
             address_text = address
             address = {}
+
         elif isinstance(address, dict):
             address_text = ""
+
         else:
             address = {}
             address_text = ""
@@ -300,8 +381,8 @@ def get_listing_date(anchor):
 
 def get_listing_location(anchor):
     """
-    Extract the city from the surrounding TCDB listing.
-    This is optional and is used only as address information.
+    Extract a city from the surrounding TCDB listing.
+    City is optional and is only used for address information.
     """
     city_pattern = re.compile(
         r"^(.+?),\s*TX(?:\s+\d{5})?$",
@@ -309,6 +390,7 @@ def get_listing_location(anchor):
     )
 
     for parent in anchor.parents:
+
         if parent.name in ("body", "html"):
             break
 
@@ -321,6 +403,7 @@ def get_listing_location(anchor):
         ]
 
         for line in lines:
+
             match = city_pattern.match(line)
 
             if match:
@@ -337,6 +420,7 @@ def get_event_links(soup):
     seen_urls = set()
 
     for anchor in soup.find_all("a", href=True):
+
         href = anchor["href"]
 
         if "CardShows.cfm" not in href:
@@ -380,8 +464,7 @@ def get_event_links(soup):
 def extract_city_from_text(text):
     """
     Look for a Texas city/state/ZIP pattern.
-    City extraction is optional. It is no longer used
-    to assign regions or reject events.
+    City is optional and is not used for region assignment.
     """
     match = re.search(
         r"([A-Za-z][A-Za-z .'-]+),\s*TX\s+\d{5}",
@@ -417,11 +500,13 @@ def extract_address_from_text(soup):
     ]
 
     for index, line in enumerate(lines):
+
         if re.search(
             r",\s*TX\s+\d{5}\b",
             line,
             re.IGNORECASE,
         ):
+
             parts = []
 
             if index >= 2:
@@ -445,8 +530,9 @@ def fetch_event_detail(session, listing):
     Fetch one event's detail page and extract:
     event name, dates, venue, and address.
 
-    Region lookup and city validation have been removed.
+    No region lookup or city validation is performed.
     """
+
     response = session.get(
         listing["url"],
         timeout=REQUEST_TIMEOUT,
@@ -484,11 +570,13 @@ def fetch_event_detail(session, listing):
         start_date = listing["listing_start"]
 
     if not end_date:
+
         range_start, range_end = parse_date_range(
             page_text
         )
 
         if range_start and range_end:
+
             if not start_date:
                 start_date = range_start
 
@@ -499,8 +587,7 @@ def fetch_event_detail(session, listing):
             f"No start date found for {event_name}"
         )
 
-    # If TCDB provides no end date, treat it as a
-    # single-day event.
+    # If TCDB provides no end date, treat it as a single-day event.
     if not end_date:
         end_date = start_date
 
@@ -522,7 +609,7 @@ def fetch_event_detail(session, listing):
             f"{event_name} ({state})"
         )
 
-    # Use visible-page address as a fallback.
+    # Fallback address extraction
     fallback_address = ""
 
     if not street or not city:
@@ -535,8 +622,7 @@ def fetch_event_detail(session, listing):
         city = extract_city_from_text(fallback_address)
 
     # Construct Venue/Address.
-    # Missing city or street address will NOT cause
-    # the event to be rejected.
+    # Missing city or street address will not reject the event.
     address_parts = []
 
     if venue:
@@ -548,6 +634,7 @@ def fetch_event_detail(session, listing):
         address_parts.append(street)
 
     if city:
+
         city_state_zip = city + ", TX"
 
         if postal_code:
@@ -576,6 +663,7 @@ def fetch_event_detail(session, listing):
 # ============================================================
 
 def scrape_tcdb():
+
     session = create_session()
 
     print("Loading TCDB Texas event listing...")
@@ -607,12 +695,14 @@ def scrape_tcdb():
     seen = set()
 
     for index, listing in enumerate(listings, start=1):
+
         print(
             f"Processing {index}/{len(listings)}: "
             f"{listing['name']}"
         )
 
         try:
+
             event = fetch_event_detail(
                 session,
                 listing,
@@ -625,6 +715,7 @@ def scrape_tcdb():
                 seen.add(key)
 
         except Exception as exc:
+
             skipped.append(
                 f"{listing['name']} | "
                 f"{listing['url']} | {exc}"
@@ -639,6 +730,9 @@ def scrape_tcdb():
         raise RuntimeError(
             "No events could be successfully collected."
         )
+
+    # Combine consecutive dates for the same event and venue.
+    events = merge_consecutive_events(events)
 
     events.sort(
         key=lambda item: (
@@ -657,6 +751,7 @@ def scrape_tcdb():
 # ============================================================
 
 def write_csv(path, rows, columns):
+
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -667,6 +762,7 @@ def write_csv(path, rows, columns):
         newline="",
         encoding="utf-8-sig",
     ) as file:
+
         writer = csv.DictWriter(
             file,
             fieldnames=columns,
@@ -689,6 +785,7 @@ def read_snapshot():
     An older five-column snapshot is treated as a new
     baseline to prevent false additions/removals.
     """
+
     if not SNAPSHOT_FILE.exists():
         return [], False
 
@@ -697,6 +794,7 @@ def read_snapshot():
         newline="",
         encoding="utf-8-sig",
     ) as file:
+
         reader = csv.DictReader(file)
 
         if reader.fieldnames != COLUMNS:
@@ -705,6 +803,7 @@ def read_snapshot():
         rows = []
 
         for row in reader:
+
             rows.append({
                 column: row.get(column, "")
                 for column in COLUMNS
@@ -718,6 +817,7 @@ def update_snapshot(events):
     Write snapshot to a temporary file first,
     then replace the previous snapshot.
     """
+
     temp_file = SNAPSHOT_FILE.with_suffix(".tmp")
 
     write_csv(
@@ -734,6 +834,7 @@ def update_snapshot(events):
 # ============================================================
 
 def calculate_changes(current, previous):
+
     current_map = {
         event_key(event): event
         for event in current
@@ -749,6 +850,7 @@ def calculate_changes(current, previous):
     for key in sorted(
         current_map.keys() - previous_map.keys()
     ):
+
         row = current_map[key].copy()
         row["Change"] = "NEW"
         changes.append(row)
@@ -756,6 +858,7 @@ def calculate_changes(current, previous):
     for key in sorted(
         previous_map.keys() - current_map.keys()
     ):
+
         row = previous_map[key].copy()
         row["Change"] = "REMOVED"
         changes.append(row)
@@ -777,6 +880,7 @@ def write_audit(
     error=None,
     baseline=False,
 ):
+
     OUTPUT_DIR.mkdir(
         parents=True,
         exist_ok=True,
@@ -786,14 +890,17 @@ def write_audit(
         "w",
         encoding="utf-8",
     ) as file:
+
         file.write(
             "TEXAS SHOW LOCATOR - SCRAPE AUDIT\n"
         )
 
         file.write("=" * 50 + "\n")
+
         file.write(
             f"Run time: {datetime.now().isoformat(timespec='seconds')}\n"
         )
+
         file.write("Source: TCDB Texas Card Shows\n")
         file.write(f"Status: {status}\n")
         file.write(f"Event links found: {found}\n")
@@ -802,6 +909,7 @@ def write_audit(
         file.write(f"Removed events: {removed_count}\n")
 
         if baseline:
+
             file.write(
                 "\nA new snapshot baseline was created. "
                 "No changes were reported for this run.\n"
@@ -811,6 +919,7 @@ def write_audit(
             file.write(f"\nERROR:\n{error}\n")
 
         if skipped:
+
             file.write(
                 "\nEVENTS THAT COULD NOT BE PROCESSED:\n"
             )
@@ -824,6 +933,7 @@ def write_audit(
 # ============================================================
 
 def main():
+
     DATA_DIR.mkdir(
         parents=True,
         exist_ok=True,
@@ -841,9 +951,11 @@ def main():
 
     # 1. Scrape TCDB.
     try:
+
         events, found, skipped = scrape_tcdb()
 
     except Exception as exc:
+
         message = str(exc)
 
         print(f"\nSCRAPE FAILED: {message}")
@@ -858,6 +970,7 @@ def main():
 
     # 2. Do not publish an incomplete scrape.
     if skipped:
+
         message = (
             f"{len(skipped)} of {found} event listings "
             "could not be processed. No reports or "
@@ -883,12 +996,14 @@ def main():
     # 4. First run or old-format snapshot:
     # establish a fresh baseline.
     if not compatible_snapshot:
+
         changes = []
         baseline = True
         new_count = 0
         removed_count = 0
 
     else:
+
         changes = calculate_changes(
             events,
             previous,
