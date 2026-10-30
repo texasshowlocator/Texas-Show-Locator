@@ -9,11 +9,13 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # ============================================================
 # TEXAS SHOW LOCATOR - TCDB ONLY
-# CSV OUTPUT - FIVE COLUMNS
+# CSV OUTPUT - FOUR COLUMNS (NO REGION)
 # ============================================================
 
 TCDB_URL = (
@@ -32,7 +34,6 @@ CHANGES_CSV = OUTPUT_DIR / "daily_changes.csv"
 AUDIT_FILE = OUTPUT_DIR / "scrape_audit.txt"
 
 COLUMNS = [
-    "Region",
     "Start",
     "End",
     "Event",
@@ -50,95 +51,44 @@ HEADERS = {
 }
 
 REQUEST_TIMEOUT = 45
-REQUEST_DELAY = 0.5
+
+# Increased delay to reduce the likelihood of HTTP 429 errors.
+REQUEST_DELAY = 1.5
+
+# Retry temporary server errors and rate limits.
+MAX_RETRIES = 5
 
 
 # ============================================================
-# TEXAS REGION ASSIGNMENTS
-#
-# These are the combined labels requested.
-# Add cities here as needed.
+# SESSION AND RETRY CONFIGURATION
 # ============================================================
 
-CITY_TO_REGION = {}
+def create_session():
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
+    retry_strategy = Retry(
+        total=MAX_RETRIES,
+        connect=MAX_RETRIES,
+        read=MAX_RETRIES,
+        status=MAX_RETRIES,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        respect_retry_after_header=True,
+        raise_on_status=True,
+    )
 
-def add_cities(region, cities):
-    for city in cities:
-        CITY_TO_REGION[city.casefold()] = region
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=10,
+        pool_maxsize=10,
+    )
 
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
 
-add_cities(
-    "Prairies & Lakes/Piney Woods",
-    [
-        "Addison", "Allen", "Arlington", "Athens", "Bedford",
-        "Bonham", "Carrollton", "Cleburne", "Commerce",
-        "Corsicana", "Dallas", "Denton", "DeSoto", "Duncanville",
-        "Ennis", "Farmers Branch", "Flower Mound", "Forney",
-        "Frisco", "Garland", "Grand Prairie", "Greenville",
-        "Haltom City", "Irving", "Kaufman", "Keller",
-        "Lancaster", "Lewisville", "Longview", "McKinney",
-        "Mesquite", "Mount Pleasant", "Nacogdoches", "Paris",
-        "Plano", "Richardson", "Rockwall", "Rowlett",
-        "Sherman", "Sulphur Springs", "Texarkana",
-        "Tyler", "Waxahachie", "Waco", "Weatherford",
-        "Whitehouse", "Wylie",
-    ],
-)
-
-add_cities(
-    "Big Bend Country/Panhandle Plains",
-    [
-        "Abilene", "Amarillo", "Andrews", "Big Spring",
-        "Borger", "Brownfield", "Canadian", "Childress",
-        "Cisco", "Colorado City", "Dalhart", "Dumas",
-        "El Paso", "Fort Stockton", "Hereford", "Lamesa",
-        "Levelland", "Lubbock", "Marfa", "Midland",
-        "Monahans", "Odessa", "Pampa", "Pecos",
-        "Plainview", "San Angelo", "Snyder", "Sweetwater",
-        "Van Horn",
-    ],
-)
-
-add_cities(
-    "Hill Country",
-    [
-        "Bandera", "Boerne", "Brady", "Brownwood",
-        "Burnet", "Canyon Lake", "Cibolo", "Comfort",
-        "Fredericksburg", "Georgetown", "Horseshoe Bay",
-        "Johnson City", "Kerrville", "Lampasas",
-        "Marble Falls", "Mason", "New Braunfels",
-        "Round Rock", "San Antonio", "San Marcos",
-        "Spring Branch", "Temple", "Wimberley",
-    ],
-)
-
-add_cities(
-    "South Texas Plains",
-    [
-        "Alice", "Alamo", "Beeville", "Brownsville",
-        "Carrizo Springs", "Cotulla", "Del Rio", "Donna",
-        "Eagle Pass", "Edinburg", "Hebbronville", "Hidalgo",
-        "Kingsville", "Laredo", "Live Oak", "McAllen",
-        "Mission", "Pharr", "Rio Grande City",
-        "Robstown", "Roma", "Uvalde", "Zapata",
-    ],
-)
-
-add_cities(
-    "Gulf Coast",
-    [
-        "Bay City", "Baytown", "Beaumont", "Brazoria",
-        "Clute", "Conroe", "Corpus Christi", "Deer Park",
-        "Freeport", "Galveston", "Friendswood", "Houston",
-        "Humble", "Jersey Village", "Lake Jackson",
-        "League City", "La Marque", "Missouri City",
-        "Nederland", "Pasadena", "Pearland", "Port Arthur",
-        "Port Lavaca", "Richmond", "Rosenberg",
-        "Sugar Land", "Texas City", "The Woodlands",
-        "Tomball", "Victoria", "Webster",
-    ],
-)
+    return session
 
 
 # ============================================================
@@ -151,12 +101,7 @@ def clean_text(value):
 
 def normalize_city(city):
     city = clean_text(city)
-    city = re.sub(r"\s+", " ", city)
     return city.strip(" ,")
-
-
-def get_region(city):
-    return CITY_TO_REGION.get(normalize_city(city).casefold())
 
 
 def parse_date(value):
@@ -168,6 +113,13 @@ def parse_date(value):
 
     value = clean_text(value)
 
+    try:
+        return datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        ).strftime("%m/%d/%y")
+    except ValueError:
+        pass
+
     formats = [
         "%Y-%m-%d",
         "%Y-%m-%dT%H:%M:%S",
@@ -178,14 +130,6 @@ def parse_date(value):
         "%b %d, %Y",
         "%A, %B %d, %Y",
     ]
-
-    # ISO dates can contain milliseconds or timezone suffixes.
-    try:
-        return datetime.fromisoformat(
-            value.replace("Z", "+00:00")
-        ).strftime("%m/%d/%y")
-    except ValueError:
-        pass
 
     for fmt in formats:
         try:
@@ -218,16 +162,18 @@ def parse_date_range(text):
     match = pattern.search(text)
 
     if match:
-        start = parse_date(match.group(1))
-        end = parse_date(match.group(2))
-        return start, end
+        return (
+            parse_date(match.group(1)),
+            parse_date(match.group(2)),
+        )
 
     return None, None
 
 
 def event_key(event):
     """
-    Event comparison key: start date + event name + venue/address.
+    Event comparison key:
+    start date + event name + venue/address.
     """
     return (
         clean_text(event["Start"]).casefold(),
@@ -284,7 +230,10 @@ def extract_jsonld_event(soup):
         event_type = obj.get("@type", "")
 
         if isinstance(event_type, list):
-            event_types = [str(x).casefold() for x in event_type]
+            event_types = [
+                str(item).casefold()
+                for item in event_type
+            ]
         else:
             event_types = [str(event_type).casefold()]
 
@@ -351,9 +300,8 @@ def get_listing_date(anchor):
 
 def get_listing_location(anchor):
     """
-    Extract a city from the event's surrounding TCDB listing.
-    This is a fallback if the event detail page does not
-    provide a structured address.
+    Extract the city from the surrounding TCDB listing.
+    This is optional and is used only as address information.
     """
     city_pattern = re.compile(
         r"^(.+?),\s*TX(?:\s+\d{5})?$",
@@ -432,6 +380,8 @@ def get_event_links(soup):
 def extract_city_from_text(text):
     """
     Look for a Texas city/state/ZIP pattern.
+    City extraction is optional. It is no longer used
+    to assign regions or reject events.
     """
     match = re.search(
         r"([A-Za-z][A-Za-z .'-]+),\s*TX\s+\d{5}",
@@ -493,7 +443,9 @@ def extract_address_from_text(soup):
 def fetch_event_detail(session, listing):
     """
     Fetch one event's detail page and extract:
-    event name, dates, venue, address, and city.
+    event name, dates, venue, and address.
+
+    Region lookup and city validation have been removed.
     """
     response = session.get(
         listing["url"],
@@ -537,7 +489,9 @@ def fetch_event_detail(session, listing):
         )
 
         if range_start and range_end:
-            start_date = range_start
+            if not start_date:
+                start_date = range_start
+
             end_date = range_end
 
     if not start_date:
@@ -545,9 +499,8 @@ def fetch_event_detail(session, listing):
             f"No start date found for {event_name}"
         )
 
-    # If TCDB provides no end date, treat the listing
-    # as a single-day event. Verify multi-day dates
-    # against the event detail page.
+    # If TCDB provides no end date, treat it as a
+    # single-day event.
     if not end_date:
         end_date = start_date
 
@@ -563,32 +516,27 @@ def fetch_event_detail(session, listing):
     state = structured.get("state", "")
     postal_code = structured.get("zip", "")
 
-    if not city:
-        city = extract_city_from_text(
-            extract_address_from_text(soup)
-        )
-
-    if not city:
-        raise ValueError(
-            f"Could not identify Texas city for {event_name}"
-        )
-
     if state and state.upper() not in ("TX", "TEXAS"):
         raise ValueError(
             f"Event does not appear to be in Texas: "
             f"{event_name} ({state})"
         )
 
-    # Fallback address
-    if not street:
-        fallback_address = extract_address_from_text(
-            soup
-        )
+    # Use visible-page address as a fallback.
+    fallback_address = ""
 
-        if fallback_address:
-            street = fallback_address
+    if not street or not city:
+        fallback_address = extract_address_from_text(soup)
 
-    # Construct the Venue/Address column.
+    if not street and fallback_address:
+        street = fallback_address
+
+    if not city and fallback_address:
+        city = extract_city_from_text(fallback_address)
+
+    # Construct Venue/Address.
+    # Missing city or street address will NOT cause
+    # the event to be rejected.
     address_parts = []
 
     if venue:
@@ -599,31 +547,23 @@ def fetch_event_detail(session, listing):
     ]:
         address_parts.append(street)
 
-    city_state_zip = city + ", TX"
+    if city:
+        city_state_zip = city + ", TX"
 
-    if postal_code:
-        city_state_zip += " " + postal_code
+        if postal_code:
+            city_state_zip += " " + postal_code
 
-    if not any(
-        city.casefold() in part.casefold()
-        for part in address_parts
-    ):
-        address_parts.append(city_state_zip)
+        if not any(
+            city.casefold() in part.casefold()
+            for part in address_parts
+        ):
+            address_parts.append(city_state_zip)
 
     venue_address = ", ".join(
         part for part in address_parts if part
     )
 
-    region = get_region(city)
-
-    if not region:
-        raise ValueError(
-            f"UNMAPPED CITY: {city}. "
-            "Add this city to CITY_TO_REGION."
-        )
-
     return {
-        "Region": region,
         "Start": start_date,
         "End": end_date,
         "Event": event_name,
@@ -636,8 +576,7 @@ def fetch_event_detail(session, listing):
 # ============================================================
 
 def scrape_tcdb():
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    session = create_session()
 
     print("Loading TCDB Texas event listing...")
 
@@ -687,9 +626,13 @@ def scrape_tcdb():
 
         except Exception as exc:
             skipped.append(
-                f"{listing['name']} | {listing['url']} | {exc}"
+                f"{listing['name']} | "
+                f"{listing['url']} | {exc}"
             )
 
+            print(f"  FAILED: {exc}")
+
+        # Delay between detail-page requests.
         time.sleep(REQUEST_DELAY)
 
     if not events:
@@ -740,9 +683,11 @@ def write_csv(path, rows, columns):
 
 def read_snapshot():
     """
-    Read the prior snapshot only if it uses the new
-    five-column format. An older-format snapshot is
-    treated as a fresh baseline to avoid false removals.
+    Read the prior snapshot only if it uses the current
+    four-column format.
+
+    An older five-column snapshot is treated as a new
+    baseline to prevent false additions/removals.
     """
     if not SNAPSHOT_FILE.exists():
         return [], False
@@ -891,10 +836,10 @@ def main():
 
     print("=" * 55)
     print("TEXAS SHOW LOCATOR")
-    print("TCDB CSV SCRAPER")
+    print("TCDB CSV SCRAPER - FOUR COLUMNS")
     print("=" * 55)
 
-    # 1. Scrape TCDB
+    # 1. Scrape TCDB.
     try:
         events, found, skipped = scrape_tcdb()
 
@@ -935,7 +880,8 @@ def main():
     # 3. Load the previous snapshot.
     previous, compatible_snapshot = read_snapshot()
 
-    # 4. First run or old snapshot: establish baseline.
+    # 4. First run or old-format snapshot:
+    # establish a fresh baseline.
     if not compatible_snapshot:
         changes = []
         baseline = True
@@ -997,6 +943,9 @@ def main():
     print(f"Events collected: {len(events)}")
     print(f"New events: {new_count}")
     print(f"Removed events: {removed_count}")
+
+    if baseline:
+        print("Snapshot: NEW BASELINE CREATED")
 
     print("\nFILES CREATED:")
     print(f"Master CSV: {MAIN_CSV}")
