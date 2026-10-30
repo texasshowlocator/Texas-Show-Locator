@@ -1,21 +1,27 @@
 import csv
+import json
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
 
-# ==================================================
-# TEXAS SHOW LOCATOR - TCDB CSV SCRAPER
-# ==================================================
+# ============================================================
+# TEXAS SHOW LOCATOR - TCDB ONLY
+# CSV OUTPUT - FIVE COLUMNS
+# ============================================================
 
 TCDB_URL = (
     "https://www.tcdb.com/CardShows.cfm"
     "?MODE=Location&State=TX&Display=Texas&Country=United%20States"
 )
+
+BASE_URL = "https://www.tcdb.com"
 
 DATA_DIR = Path("data")
 OUTPUT_DIR = Path("output")
@@ -26,104 +32,335 @@ CHANGES_CSV = OUTPUT_DIR / "daily_changes.csv"
 AUDIT_FILE = OUTPUT_DIR / "scrape_audit.txt"
 
 COLUMNS = [
-    "Start Date",
-    "End Date",
-    "Event Name",
-    "Event Location",
-    "Source Website",
+    "Region",
+    "Start",
+    "End",
+    "Event",
+    "Venue/Address",
 ]
+
+CHANGE_COLUMNS = ["Change"] + COLUMNS
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 Chrome/130.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0 Safari/537.36"
     )
 }
 
-DATE_PATTERN = re.compile(
-    r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), "
-    r"[A-Za-z]+ \d{1,2}, \d{4}",
-    re.IGNORECASE,
+REQUEST_TIMEOUT = 45
+REQUEST_DELAY = 0.5
+
+
+# ============================================================
+# TEXAS REGION ASSIGNMENTS
+#
+# These are the combined labels requested.
+# Add cities here as needed.
+# ============================================================
+
+CITY_TO_REGION = {}
+
+
+def add_cities(region, cities):
+    for city in cities:
+        CITY_TO_REGION[city.casefold()] = region
+
+
+add_cities(
+    "Prairies & Lakes/Piney Woods",
+    [
+        "Addison", "Allen", "Arlington", "Athens", "Bedford",
+        "Bonham", "Carrollton", "Cleburne", "Commerce",
+        "Corsicana", "Dallas", "Denton", "DeSoto", "Duncanville",
+        "Ennis", "Farmers Branch", "Flower Mound", "Forney",
+        "Frisco", "Garland", "Grand Prairie", "Greenville",
+        "Haltom City", "Irving", "Kaufman", "Keller",
+        "Lancaster", "Lewisville", "Longview", "McKinney",
+        "Mesquite", "Mount Pleasant", "Nacogdoches", "Paris",
+        "Plano", "Richardson", "Rockwall", "Rowlett",
+        "Sherman", "Sulphur Springs", "Texarkana",
+        "Tyler", "Waxahachie", "Waco", "Weatherford",
+        "Whitehouse", "Wylie",
+    ],
 )
 
-CITY_PATTERN = re.compile(
-    r"^[A-Za-z0-9 .,'’()&/-]+,\s*TX$",
-    re.IGNORECASE,
+add_cities(
+    "Big Bend Country/Panhandle Plains",
+    [
+        "Abilene", "Amarillo", "Andrews", "Big Spring",
+        "Borger", "Brownfield", "Canadian", "Childress",
+        "Cisco", "Colorado City", "Dalhart", "Dumas",
+        "El Paso", "Fort Stockton", "Hereford", "Lamesa",
+        "Levelland", "Lubbock", "Marfa", "Midland",
+        "Monahans", "Odessa", "Pampa", "Pecos",
+        "Plainview", "San Angelo", "Snyder", "Sweetwater",
+        "Van Horn",
+    ],
 )
 
-TIME_PATTERN = re.compile(
-    r"\b\d{1,2}:\d{2}\s*(?:AM|PM)\s*-\s*"
-    r"\d{1,2}:\d{2}\s*(?:AM|PM)\b",
-    re.IGNORECASE,
+add_cities(
+    "Hill Country",
+    [
+        "Bandera", "Boerne", "Brady", "Brownwood",
+        "Burnet", "Canyon Lake", "Cibolo", "Comfort",
+        "Fredericksburg", "Georgetown", "Horseshoe Bay",
+        "Johnson City", "Kerrville", "Lampasas",
+        "Marble Falls", "Mason", "New Braunfels",
+        "Round Rock", "San Antonio", "San Marcos",
+        "Spring Branch", "Temple", "Wimberley",
+    ],
+)
+
+add_cities(
+    "South Texas Plains",
+    [
+        "Alice", "Alamo", "Beeville", "Brownsville",
+        "Carrizo Springs", "Cotulla", "Del Rio", "Donna",
+        "Eagle Pass", "Edinburg", "Hebbronville", "Hidalgo",
+        "Kingsville", "Laredo", "Live Oak", "McAllen",
+        "Mission", "Pharr", "Rio Grande City",
+        "Robstown", "Roma", "Uvalde", "Zapata",
+    ],
+)
+
+add_cities(
+    "Gulf Coast",
+    [
+        "Bay City", "Baytown", "Beaumont", "Brazoria",
+        "Clute", "Conroe", "Corpus Christi", "Deer Park",
+        "Freeport", "Galveston", "Friendswood", "Houston",
+        "Humble", "Jersey Village", "Lake Jackson",
+        "League City", "La Marque", "Missouri City",
+        "Nederland", "Pasadena", "Pearland", "Port Arthur",
+        "Port Lavaca", "Richmond", "Rosenberg",
+        "Sugar Land", "Texas City", "The Woodlands",
+        "Tomball", "Victoria", "Webster",
+    ],
 )
 
 
-# ==================================================
-# TEXT AND DATE HELPERS
-# ==================================================
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
 
 def clean_text(value):
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+def normalize_city(city):
+    city = clean_text(city)
+    city = re.sub(r"\s+", " ", city)
+    return city.strip(" ,")
+
+
+def get_region(city):
+    return CITY_TO_REGION.get(normalize_city(city).casefold())
+
+
 def parse_date(value):
+    """
+    Convert common date formats to MM/DD/YY.
+    """
+    if not value:
+        return None
+
     value = clean_text(value)
 
+    formats = [
+        "%Y-%m-%d",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%B %d, %Y",
+        "%b %d, %Y",
+        "%A, %B %d, %Y",
+    ]
+
+    # ISO dates can contain milliseconds or timezone suffixes.
     try:
-        return datetime.strptime(
-            value, "%A, %B %d, %Y"
-        ).strftime("%Y-%m-%d")
+        return datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        ).strftime("%m/%d/%y")
     except ValueError:
-        raise ValueError(f"Could not parse date: {value}")
+        pass
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(
+                value, fmt
+            ).strftime("%m/%d/%y")
+        except ValueError:
+            continue
+
+    return None
+
+
+def parse_date_range(text):
+    """
+    Find a date range in visible event-page text.
+    Returns (start, end), or (None, None).
+    """
+    month = (
+        r"(?:January|February|March|April|May|June|July|"
+        r"August|September|October|November|December)"
+    )
+
+    pattern = re.compile(
+        rf"({month}\s+\d{{1,2}},?\s+\d{{4}})"
+        rf"\s*(?:-|–|—|to|through)\s*"
+        rf"({month}\s+\d{{1,2}},?\s+\d{{4}})",
+        re.IGNORECASE,
+    )
+
+    match = pattern.search(text)
+
+    if match:
+        start = parse_date(match.group(1))
+        end = parse_date(match.group(2))
+        return start, end
+
+    return None, None
 
 
 def event_key(event):
     """
-    Compare events using start date, event name,
-    and location.
+    Event comparison key: start date + event name + venue/address.
     """
     return (
-        clean_text(event["Start Date"]).casefold(),
-        clean_text(event["Event Name"]).casefold(),
-        clean_text(event["Event Location"]).casefold(),
+        clean_text(event["Start"]).casefold(),
+        clean_text(event["Event"]).casefold(),
+        clean_text(event["Venue/Address"]).casefold(),
     )
 
 
-# ==================================================
-# EVENT DATE EXTRACTION
-# ==================================================
+# ============================================================
+# JSON-LD EXTRACTION
+# ============================================================
 
-def get_event_date(anchor):
+def walk_json(data):
     """
-    Find the nearest preceding date heading
-    associated with the event listing.
+    Recursively find dictionaries inside JSON-LD data.
     """
+    if isinstance(data, dict):
+        yield data
+
+        for value in data.values():
+            yield from walk_json(value)
+
+    elif isinstance(data, list):
+        for value in data:
+            yield from walk_json(value)
+
+
+def get_jsonld_objects(soup):
+    objects = []
+
+    for script in soup.find_all(
+        "script",
+        type="application/ld+json",
+    ):
+        raw = script.string or script.get_text()
+
+        if not raw:
+            continue
+
+        try:
+            data = json.loads(raw)
+            objects.extend(walk_json(data))
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    return objects
+
+
+def extract_jsonld_event(soup):
+    """
+    Return the most useful Event object and its location.
+    """
+    for obj in get_jsonld_objects(soup):
+        event_type = obj.get("@type", "")
+
+        if isinstance(event_type, list):
+            event_types = [str(x).casefold() for x in event_type]
+        else:
+            event_types = [str(event_type).casefold()]
+
+        if not any("event" in item for item in event_types):
+            continue
+
+        location = obj.get("location", {})
+
+        if isinstance(location, list):
+            location = location[0] if location else {}
+
+        if not isinstance(location, dict):
+            location = {}
+
+        address = location.get("address", {})
+
+        if isinstance(address, str):
+            address_text = address
+            address = {}
+        elif isinstance(address, dict):
+            address_text = ""
+        else:
+            address = {}
+            address_text = ""
+
+        return {
+            "name": clean_text(obj.get("name")),
+            "start": obj.get("startDate"),
+            "end": obj.get("endDate"),
+            "venue": clean_text(location.get("name")),
+            "street": clean_text(address.get("streetAddress")),
+            "city": clean_text(address.get("addressLocality")),
+            "state": clean_text(address.get("addressRegion")),
+            "zip": clean_text(address.get("postalCode")),
+            "address_text": address_text,
+        }
+
+    return {}
+
+
+# ============================================================
+# LISTING PAGE EXTRACTION
+# ============================================================
+
+def get_listing_date(anchor):
+    """
+    Find the date heading immediately associated with a listing.
+    """
+    date_pattern = re.compile(
+        r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), "
+        r"[A-Za-z]+\s+\d{1,2},\s+\d{4}",
+        re.IGNORECASE,
+    )
+
     previous_dates = anchor.find_all_previous(
-        string=DATE_PATTERN
+        string=date_pattern
     )
 
     if not previous_dates:
-        raise ValueError(
-            f"No date heading found for "
-            f"{anchor.get_text(' ', strip=True)}"
-        )
+        return None
 
     return parse_date(previous_dates[0])
 
 
-# ==================================================
-# EVENT LOCATION EXTRACTION
-# ==================================================
-
-def get_event_location(anchor):
+def get_listing_location(anchor):
     """
-    Find the venue and Texas city in the event's
-    surrounding listing block.
+    Extract a city from the event's surrounding TCDB listing.
+    This is a fallback if the event detail page does not
+    provide a structured address.
     """
-    selected_lines = []
+    city_pattern = re.compile(
+        r"^(.+?),\s*TX(?:\s+\d{5})?$",
+        re.IGNORECASE,
+    )
 
     for parent in anchor.parents:
-
         if parent.name in ("body", "html"):
             break
 
@@ -135,82 +372,25 @@ def get_event_location(anchor):
             if clean_text(line)
         ]
 
-        has_city = any(
-            CITY_PATTERN.match(line)
-            for line in lines
-        )
+        for line in lines:
+            match = city_pattern.match(line)
 
-        has_time = any(
-            TIME_PATTERN.search(line)
-            for line in lines
-        )
+            if match:
+                return normalize_city(match.group(1))
 
-        if has_city and has_time:
-            selected_lines = lines
-            break
-
-    if not selected_lines:
-        raise ValueError(
-            f"Could not identify location for "
-            f"{anchor.get_text(' ', strip=True)}"
-        )
-
-    city_index = next(
-        i for i, line in enumerate(selected_lines)
-        if CITY_PATTERN.match(line)
-    )
-
-    city = selected_lines[city_index]
-    venue = ""
-
-    if city_index > 0:
-        possible_venue = selected_lines[city_index - 1]
-
-        if (
-            possible_venue
-            and not TIME_PATTERN.search(possible_venue)
-            and not DATE_PATTERN.search(possible_venue)
-        ):
-            venue = possible_venue
-
-    if venue:
-        return f"{venue}, {city}"
-
-    return city
+    return None
 
 
-# ==================================================
-# TCDB SCRAPER
-# ==================================================
-
-def scrape_tcdb():
-
-    print("Connecting to TCDB Texas Card Shows...")
-
-    response = requests.get(
-        TCDB_URL,
-        headers=HEADERS,
-        timeout=45,
-    )
-
-    response.raise_for_status()
-
-    soup = BeautifulSoup(
-        response.text,
-        "html.parser",
-    )
-
-    events = []
-    seen = set()
-    links_found = 0
-    skipped = []
+def get_event_links(soup):
+    """
+    Collect unique TCDB event-detail links.
+    """
+    results = []
+    seen_urls = set()
 
     for anchor in soup.find_all("a", href=True):
-
         href = anchor["href"]
 
-        # TCDB event detail links contain CardShows.cfm
-        # and a numeric ID parameter.
         if "CardShows.cfm" not in href:
             continue
 
@@ -221,27 +401,283 @@ def scrape_tcdb():
         ):
             continue
 
-        event_name = clean_text(
+        name = clean_text(
             anchor.get_text(" ", strip=True)
         )
 
-        if not event_name:
+        if not name:
             continue
 
-        links_found += 1
+        url = urljoin(BASE_URL, href)
+
+        if url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+
+        results.append({
+            "url": url,
+            "name": name,
+            "listing_start": get_listing_date(anchor),
+            "listing_city": get_listing_location(anchor),
+        })
+
+    return results
+
+
+# ============================================================
+# EVENT DETAIL PAGE EXTRACTION
+# ============================================================
+
+def extract_city_from_text(text):
+    """
+    Look for a Texas city/state/ZIP pattern.
+    """
+    match = re.search(
+        r"([A-Za-z][A-Za-z .'-]+),\s*TX\s+\d{5}",
+        text,
+        re.IGNORECASE,
+    )
+
+    if match:
+        return normalize_city(match.group(1))
+
+    match = re.search(
+        r"([A-Za-z][A-Za-z .'-]+),\s*TX\b",
+        text,
+        re.IGNORECASE,
+    )
+
+    if match:
+        return normalize_city(match.group(1))
+
+    return None
+
+
+def extract_address_from_text(soup):
+    """
+    Fallback address extraction from visible page text.
+    """
+    lines = [
+        clean_text(line)
+        for line in soup.get_text(
+            "\n", strip=True
+        ).splitlines()
+        if clean_text(line)
+    ]
+
+    for index, line in enumerate(lines):
+        if re.search(
+            r",\s*TX\s+\d{5}\b",
+            line,
+            re.IGNORECASE,
+        ):
+            parts = []
+
+            if index >= 2:
+                parts.append(lines[index - 2])
+                parts.append(lines[index - 1])
+
+            elif index >= 1:
+                parts.append(lines[index - 1])
+
+            parts.append(line)
+
+            return ", ".join(
+                part for part in parts if part
+            )
+
+    return ""
+
+
+def fetch_event_detail(session, listing):
+    """
+    Fetch one event's detail page and extract:
+    event name, dates, venue, address, and city.
+    """
+    response = session.get(
+        listing["url"],
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser",
+    )
+
+    page_text = clean_text(
+        soup.get_text(" ", strip=True)
+    )
+
+    structured = extract_jsonld_event(soup)
+
+    # Event name
+    event_name = (
+        structured.get("name")
+        or listing["name"]
+    )
+
+    # Dates
+    start_date = parse_date(
+        structured.get("start")
+    )
+
+    end_date = parse_date(
+        structured.get("end")
+    )
+
+    if not start_date:
+        start_date = listing["listing_start"]
+
+    if not end_date:
+        range_start, range_end = parse_date_range(
+            page_text
+        )
+
+        if range_start and range_end:
+            start_date = range_start
+            end_date = range_end
+
+    if not start_date:
+        raise ValueError(
+            f"No start date found for {event_name}"
+        )
+
+    # If TCDB provides no end date, treat the listing
+    # as a single-day event. Verify multi-day dates
+    # against the event detail page.
+    if not end_date:
+        end_date = start_date
+
+    # Address and city
+    city = (
+        structured.get("city")
+        or listing.get("listing_city")
+        or extract_city_from_text(page_text)
+    )
+
+    street = structured.get("street", "")
+    venue = structured.get("venue", "")
+    state = structured.get("state", "")
+    postal_code = structured.get("zip", "")
+
+    if not city:
+        city = extract_city_from_text(
+            extract_address_from_text(soup)
+        )
+
+    if not city:
+        raise ValueError(
+            f"Could not identify Texas city for {event_name}"
+        )
+
+    if state and state.upper() not in ("TX", "TEXAS"):
+        raise ValueError(
+            f"Event does not appear to be in Texas: "
+            f"{event_name} ({state})"
+        )
+
+    # Fallback address
+    if not street:
+        fallback_address = extract_address_from_text(
+            soup
+        )
+
+        if fallback_address:
+            street = fallback_address
+
+    # Construct the Venue/Address column.
+    address_parts = []
+
+    if venue:
+        address_parts.append(venue)
+
+    if street and street.casefold() not in [
+        part.casefold() for part in address_parts
+    ]:
+        address_parts.append(street)
+
+    city_state_zip = city + ", TX"
+
+    if postal_code:
+        city_state_zip += " " + postal_code
+
+    if not any(
+        city.casefold() in part.casefold()
+        for part in address_parts
+    ):
+        address_parts.append(city_state_zip)
+
+    venue_address = ", ".join(
+        part for part in address_parts if part
+    )
+
+    region = get_region(city)
+
+    if not region:
+        raise ValueError(
+            f"UNMAPPED CITY: {city}. "
+            "Add this city to CITY_TO_REGION."
+        )
+
+    return {
+        "Region": region,
+        "Start": start_date,
+        "End": end_date,
+        "Event": event_name,
+        "Venue/Address": venue_address,
+    }
+
+
+# ============================================================
+# SCRAPE ALL TCDB EVENTS
+# ============================================================
+
+def scrape_tcdb():
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    print("Loading TCDB Texas event listing...")
+
+    response = session.get(
+        TCDB_URL,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser",
+    )
+
+    listings = get_event_links(soup)
+
+    if not listings:
+        raise RuntimeError(
+            "No TCDB event links were found. "
+            "The TCDB page layout may have changed."
+        )
+
+    print(f"Event links found: {len(listings)}")
+
+    events = []
+    skipped = []
+    seen = set()
+
+    for index, listing in enumerate(listings, start=1):
+        print(
+            f"Processing {index}/{len(listings)}: "
+            f"{listing['name']}"
+        )
 
         try:
-
-            start_date = get_event_date(anchor)
-            location = get_event_location(anchor)
-
-            event = {
-                "Start Date": start_date,
-                "End Date": start_date,
-                "Event Name": event_name,
-                "Event Location": location,
-                "Source Website": TCDB_URL,
-            }
+            event = fetch_event_detail(
+                session,
+                listing,
+            )
 
             key = event_key(event)
 
@@ -250,44 +686,34 @@ def scrape_tcdb():
                 seen.add(key)
 
         except Exception as exc:
-
             skipped.append(
-                f"{event_name}: {exc}"
+                f"{listing['name']} | {listing['url']} | {exc}"
             )
 
-    if links_found == 0:
-        raise RuntimeError(
-            "No recognizable TCDB event links found. "
-            "The website layout may have changed."
-        )
+        time.sleep(REQUEST_DELAY)
 
     if not events:
         raise RuntimeError(
-            "TCDB event links were found, but no events "
-            "could be parsed."
+            "No events could be successfully collected."
         )
 
     events.sort(
         key=lambda item: (
-            item["Start Date"],
-            item["Event Name"].casefold(),
-            item["Event Location"].casefold(),
+            datetime.strptime(
+                item["Start"], "%m/%d/%y"
+            ),
+            item["Event"].casefold(),
         )
     )
 
-    print(f"Event links found: {links_found}")
-    print(f"Events collected: {len(events)}")
-    print(f"Events skipped: {len(skipped)}")
-
-    return events, links_found, skipped
+    return events, len(listings), skipped
 
 
-# ==================================================
-# CSV WRITER
-# ==================================================
+# ============================================================
+# CSV FILE WRITING
+# ============================================================
 
-def write_csv(path, rows, columns=COLUMNS):
-
+def write_csv(path, rows, columns):
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -298,7 +724,6 @@ def write_csv(path, rows, columns=COLUMNS):
         newline="",
         encoding="utf-8-sig",
     ) as file:
-
         writer = csv.DictWriter(
             file,
             fieldnames=columns,
@@ -309,109 +734,104 @@ def write_csv(path, rows, columns=COLUMNS):
         writer.writerows(rows)
 
 
-# ==================================================
-# SNAPSHOT READER
-# ==================================================
+# ============================================================
+# SNAPSHOT MANAGEMENT
+# ============================================================
 
 def read_snapshot():
-
+    """
+    Read the prior snapshot only if it uses the new
+    five-column format. An older-format snapshot is
+    treated as a fresh baseline to avoid false removals.
+    """
     if not SNAPSHOT_FILE.exists():
-        return []
+        return [], False
 
     with SNAPSHOT_FILE.open(
         "r",
         newline="",
         encoding="utf-8-sig",
     ) as file:
-
         reader = csv.DictReader(file)
 
-        return [
-            {
+        if reader.fieldnames != COLUMNS:
+            return [], False
+
+        rows = []
+
+        for row in reader:
+            rows.append({
                 column: row.get(column, "")
                 for column in COLUMNS
-            }
-            for row in reader
-        ]
+            })
+
+        return rows, True
 
 
-# ==================================================
-# DAILY CHANGE COMPARISON
-# ==================================================
+def update_snapshot(events):
+    """
+    Write snapshot to a temporary file first,
+    then replace the previous snapshot.
+    """
+    temp_file = SNAPSHOT_FILE.with_suffix(".tmp")
 
-def calculate_changes(
-    current_events,
-    previous_events,
-):
-
-    previous_by_key = {
-        event_key(event): event
-        for event in previous_events
-    }
-
-    current_by_key = {
-        event_key(event): event
-        for event in current_events
-    }
-
-    new_keys = (
-        current_by_key.keys()
-        - previous_by_key.keys()
+    write_csv(
+        temp_file,
+        events,
+        COLUMNS,
     )
 
-    removed_keys = (
-        previous_by_key.keys()
-        - current_by_key.keys()
-    )
+    temp_file.replace(SNAPSHOT_FILE)
+
+
+# ============================================================
+# DAILY CHANGE DETECTION
+# ============================================================
+
+def calculate_changes(current, previous):
+    current_map = {
+        event_key(event): event
+        for event in current
+    }
+
+    previous_map = {
+        event_key(event): event
+        for event in previous
+    }
 
     changes = []
 
-    for key in sorted(new_keys):
+    for key in sorted(
+        current_map.keys() - previous_map.keys()
+    ):
+        row = current_map[key].copy()
+        row["Change"] = "NEW"
+        changes.append(row)
 
-        event = current_by_key[key].copy()
-        event["Change"] = "NEW"
-
-        changes.append(event)
-
-    for key in sorted(removed_keys):
-
-        event = previous_by_key[key].copy()
-        event["Change"] = "REMOVED"
-
-        changes.append(event)
+    for key in sorted(
+        previous_map.keys() - current_map.keys()
+    ):
+        row = previous_map[key].copy()
+        row["Change"] = "REMOVED"
+        changes.append(row)
 
     return changes
 
 
-# ==================================================
-# DAILY CHANGES CSV
-# ==================================================
-
-def write_changes_csv(changes):
-
-    change_columns = ["Change"] + COLUMNS
-
-    write_csv(
-        CHANGES_CSV,
-        changes,
-        change_columns,
-    )
-
-
-# ==================================================
+# ============================================================
 # AUDIT REPORT
-# ==================================================
+# ============================================================
 
 def write_audit(
     status,
-    event_count=0,
-    links_found=0,
+    found=0,
+    collected=0,
     skipped=None,
-    error=None,
     new_count=0,
     removed_count=0,
+    error=None,
+    baseline=False,
 ):
-
     OUTPUT_DIR.mkdir(
         parents=True,
         exist_ok=True,
@@ -421,44 +841,44 @@ def write_audit(
         "w",
         encoding="utf-8",
     ) as file:
-
         file.write(
             "TEXAS SHOW LOCATOR - SCRAPE AUDIT\n"
         )
 
-        file.write("=" * 45 + "\n")
-
+        file.write("=" * 50 + "\n")
         file.write(
-            f"Run time: "
-            f"{datetime.now().isoformat(timespec='seconds')}\n"
+            f"Run time: {datetime.now().isoformat(timespec='seconds')}\n"
         )
-
         file.write("Source: TCDB Texas Card Shows\n")
         file.write(f"Status: {status}\n")
-        file.write(f"Event links found: {links_found}\n")
-        file.write(f"Events collected: {event_count}\n")
+        file.write(f"Event links found: {found}\n")
+        file.write(f"Events collected: {collected}\n")
         file.write(f"New events: {new_count}\n")
         file.write(f"Removed events: {removed_count}\n")
+
+        if baseline:
+            file.write(
+                "\nA new snapshot baseline was created. "
+                "No changes were reported for this run.\n"
+            )
 
         if error:
             file.write(f"\nERROR:\n{error}\n")
 
         if skipped:
-
             file.write(
-                "\nEVENTS THAT COULD NOT BE PARSED:\n"
+                "\nEVENTS THAT COULD NOT BE PROCESSED:\n"
             )
 
             for item in skipped:
                 file.write(f"- {item}\n")
 
 
-# ==================================================
-# MAIN PROGRAM
-# ==================================================
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-
     DATA_DIR.mkdir(
         parents=True,
         exist_ok=True,
@@ -469,136 +889,120 @@ def main():
         exist_ok=True,
     )
 
-    # ----------------------------------------------
+    print("=" * 55)
+    print("TEXAS SHOW LOCATOR")
+    print("TCDB CSV SCRAPER")
+    print("=" * 55)
+
     # 1. Scrape TCDB
-    # ----------------------------------------------
-
     try:
-
-        (
-            current_events,
-            links_found,
-            skipped,
-        ) = scrape_tcdb()
+        events, found, skipped = scrape_tcdb()
 
     except Exception as exc:
-
         message = str(exc)
 
         print(f"\nSCRAPE FAILED: {message}")
-        print("Previous snapshot was preserved.")
+        print("Previous snapshot was not changed.")
 
         write_audit(
-            status="FAILED - PREVIOUS SNAPSHOT PRESERVED",
+            status="FAILED - SNAPSHOT PRESERVED",
             error=message,
         )
 
         sys.exit(1)
 
-    # ----------------------------------------------
-    # 2. Reject incomplete scrapes
-    # ----------------------------------------------
-
+    # 2. Do not publish an incomplete scrape.
     if skipped:
-
         message = (
-            f"{len(skipped)} event listings could not "
-            "be parsed. Snapshot was not updated."
+            f"{len(skipped)} of {found} event listings "
+            "could not be processed. No reports or "
+            "snapshot were updated."
         )
 
         print(f"\nSCRAPE FAILED: {message}")
         print("Previous snapshot was preserved.")
 
         write_audit(
-            status="FAILED - PREVIOUS SNAPSHOT PRESERVED",
-            event_count=len(current_events),
-            links_found=links_found,
+            status="FAILED - SNAPSHOT PRESERVED",
+            found=found,
+            collected=len(events),
             skipped=skipped,
             error=message,
         )
 
         sys.exit(1)
 
-    # ----------------------------------------------
-    # 3. Read previous snapshot
-    # ----------------------------------------------
+    # 3. Load the previous snapshot.
+    previous, compatible_snapshot = read_snapshot()
 
-    previous_events = read_snapshot()
+    # 4. First run or old snapshot: establish baseline.
+    if not compatible_snapshot:
+        changes = []
+        baseline = True
+        new_count = 0
+        removed_count = 0
 
-    # ----------------------------------------------
-    # 4. Compare current and previous events
-    # ----------------------------------------------
+    else:
+        changes = calculate_changes(
+            events,
+            previous,
+        )
 
-    changes = calculate_changes(
-        current_events,
-        previous_events,
-    )
+        new_count = sum(
+            1 for row in changes
+            if row["Change"] == "NEW"
+        )
 
-    new_count = sum(
-        1 for row in changes
-        if row["Change"] == "NEW"
-    )
+        removed_count = sum(
+            1 for row in changes
+            if row["Change"] == "REMOVED"
+        )
 
-    removed_count = sum(
-        1 for row in changes
-        if row["Change"] == "REMOVED"
-    )
+        baseline = False
 
-    # ----------------------------------------------
-    # 5. Write main CSV
-    # ----------------------------------------------
-
+    # 5. Write master CSV.
     write_csv(
         MAIN_CSV,
-        current_events,
+        events,
+        COLUMNS,
     )
 
-    # ----------------------------------------------
-    # 6. Write daily changes CSV
-    # ----------------------------------------------
-
-    write_changes_csv(changes)
-
-    # ----------------------------------------------
-    # 7. Update snapshot after successful scrape
-    # ----------------------------------------------
-
+    # 6. Write daily changes CSV.
     write_csv(
-        SNAPSHOT_FILE,
-        current_events,
+        CHANGES_CSV,
+        changes,
+        CHANGE_COLUMNS,
     )
 
-    # ----------------------------------------------
-    # 8. Write audit report
-    # ----------------------------------------------
+    # 7. Update snapshot only after successful scrape.
+    update_snapshot(events)
 
+    # 8. Write audit report.
     write_audit(
         status="SUCCESS",
-        event_count=len(current_events),
-        links_found=links_found,
+        found=found,
+        collected=len(events),
         skipped=skipped,
         new_count=new_count,
         removed_count=removed_count,
+        baseline=baseline,
     )
 
-    # ----------------------------------------------
-    # 9. Print results
-    # ----------------------------------------------
+    # 9. Print summary.
+    print("\n" + "=" * 55)
+    print("SCRAPE COMPLETED SUCCESSFULLY")
+    print("=" * 55)
 
-    print("\n===================================")
-    print("TEXAS SHOW LOCATOR SCRAPE COMPLETE")
-    print("===================================")
-
-    print(f"Events collected: {len(current_events)}")
+    print(f"Event links found: {found}")
+    print(f"Events collected: {len(events)}")
     print(f"New events: {new_count}")
     print(f"Removed events: {removed_count}")
 
     print("\nFILES CREATED:")
-
-    print(f"- {MAIN_CSV}")
-    print(f"- {CHANGES_CSV}")
-    print(f"- {AUDIT_FILE}")
-    print(f"- {SNAPSHOT_FILE}")
+    print(f"Master CSV: {MAIN_CSV}")
+    print(f"Daily changes: {CHANGES_CSV}")
+    print(f"Audit report: {AUDIT_FILE}")
+    print(f"Snapshot: {SNAPSHOT_FILE}")
 
 
 if __name__ == "__main__":
