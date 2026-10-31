@@ -9,6 +9,7 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -279,17 +280,20 @@ def extract_event_jsonld(soup):
     return {}
 
 
-def extract_address_from_visible_text(soup):
-    lines = [
-        clean_text(line)
-        for line in soup.get_text("\n", strip=True).splitlines()
-        if clean_text(line)
-    ]
+def extract_address_from_visible_text(soup=None, rendered_text=""):
+    # Prefer browser-rendered text because the location panel is client-rendered.
+    source_text = rendered_text or (soup.get_text("\n", strip=True) if soup else "")
+    lines = [clean_text(line) for line in source_text.splitlines() if clean_text(line)]
 
-    # Treasure often renders the full venue and address on one line,
-    # ending in "TX, USA" without a ZIP code.
-    for line in lines:
-        if re.search(r",\s*(?:TX|Texas)(?:\s+\d{5}(?:-\d{4})?)?\s*,?\s*USA\b", line, re.I):
+    # The rendered location panel commonly places the venue immediately
+    # before the street address.
+    for index, line in enumerate(lines):
+        if re.search(r"\b(?:TX|Texas)(?:\s+\d{5}(?:-\d{4})?)?\s*,?\s*USA\b", line, re.I):
+            previous = lines[index - 1] if index > 0 else ""
+            ignored = ("event location", "directions", "map unavailable", "open the location")
+            if previous and not any(token in previous.casefold() for token in ignored):
+                if not re.search(r"\b(?:TX|Texas)\b", previous, re.I):
+                    return "{}, {}".format(previous, line)
             return line
 
     # Some pages show the address as separate lines under "Event Location".
@@ -319,16 +323,27 @@ def extract_address_from_visible_text(soup):
     return ""
 
 
-def fetch_event_details(session, item):
+def fetch_event_details(session, item, browser_page):
     slug = clean_text(item.get("cleaned_name"))
     if not slug:
         raise ValueError(f"Event has no detail-page slug: {item.get('name')}")
 
     detail_url = urljoin(BASE_URL, f"/events/{slug}")
-    response = session.get(detail_url, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
+    response = browser_page.goto(
+        detail_url,
+        wait_until="domcontentloaded",
+        timeout=90000,
+    )
+    if response and response.status >= 400:
+        raise RuntimeError("Detail page returned HTTP {}".format(response.status))
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    try:
+        browser_page.locator("body").wait_for(timeout=20000)
+        rendered_text = browser_page.locator("body").inner_text(timeout=20000)
+    except Exception as exc:
+        raise RuntimeError("Could not read rendered event page: {}".format(exc)) from exc
+
+    soup = BeautifulSoup(browser_page.content(), "html.parser")
     structured = extract_event_jsonld(soup)
 
     name = (
@@ -372,7 +387,7 @@ def fetch_event_details(session, item):
     # Use rendered page content to fill missing venue/address fields.
     # The structured data may contain a venue name but omit its street address.
     if not street or not venue or not address_text:
-        fallback = extract_address_from_visible_text(soup)
+        fallback = extract_address_from_visible_text(soup, rendered_text)
         if fallback:
             # If the rendered location already includes the structured venue
             # or street, keep the complete line instead of duplicating it.
@@ -610,16 +625,24 @@ def main():
         events = []
         failures = []
 
-        for index, item in enumerate(listing_items, start=1):
-            label = clean_text(item.get("name")) or item.get("id", "Unknown")
-            print(f"Detail {index}/{len(listing_items)}: {label}")
-
+        # One browser session renders the client-side venue/location panel.
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(
+                user_agent=HEADERS["User-Agent"],
+                viewport={"width": 1440, "height": 1100},
+            )
             try:
-                events.append(fetch_event_details(session, item))
-            except Exception as exc:
-                failures.append(f"{label}: {exc}")
-
-            time.sleep(REQUEST_DELAY)
+                for index, item in enumerate(listing_items, start=1):
+                    label = clean_text(item.get("name")) or item.get("id", "Unknown")
+                    print("Detail {}/{}: {}".format(index, len(listing_items), label))
+                    try:
+                        events.append(fetch_event_details(session, item, page))
+                    except Exception as exc:
+                        failures.append("{}: {}".format(label, exc))
+                    time.sleep(REQUEST_DELAY)
+            finally:
+                browser.close()
 
         if failures:
             raise RuntimeError(
