@@ -93,16 +93,16 @@ def clean_venue_address(value):
 
     # Remove date labels sometimes inserted by the rendered location widget.
     text = re.sub(
-        r"\\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\\s+"
-        r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+"
-        r"\\d{1,2}(?:\\s*[–-]\\s*\\d{1,2})?,?\\s+\\d{4}\\b",
+        r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+"
+        r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
+        r"\d{1,2}(?:\s*[–-]\s*\d{1,2})?,?\s+\d{4}\b",
         "",
         text,
         flags=re.I,
     )
     text = re.sub(
-        r"\\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+"
-        r"\\d{1,2}(?:\\s*[–-]\\s*\\d{1,2})?,?\\s+\\d{4}\\b",
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
+        r"\d{1,2}(?:\s*[–-]\s*\d{1,2})?,?\s+\d{4}\b",
         "",
         text,
         flags=re.I,
@@ -118,7 +118,7 @@ def clean_venue_address(value):
         # These are interface labels, not venue or address information.
         if re.fullmatch(r"venue", part, re.I):
             continue
-        if re.fullmatch(r"\\+\\d+", part):
+        if re.fullmatch(r"\+\d+", part):
             continue
 
         key = part.casefold()
