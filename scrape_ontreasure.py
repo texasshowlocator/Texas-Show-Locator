@@ -87,6 +87,48 @@ def clean_text(value):
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+def clean_venue_address(value):
+    """Remove map-widget labels, embedded dates, and repeated venue names."""
+    text = clean_text(value).replace("EUA", "USA")
+
+    # Remove date labels sometimes inserted by the rendered location widget.
+    text = re.sub(
+        r"\\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\\s+"
+        r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+"
+        r"\\d{1,2}(?:\\s*[–-]\\s*\\d{1,2})?,?\\s+\\d{4}\\b",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+"
+        r"\\d{1,2}(?:\\s*[–-]\\s*\\d{1,2})?,?\\s+\\d{4}\\b",
+        "",
+        text,
+        flags=re.I,
+    )
+
+    parts = []
+    seen = set()
+    for raw_part in text.split(","):
+        part = clean_text(raw_part)
+        if not part:
+            continue
+
+        # These are interface labels, not venue or address information.
+        if re.fullmatch(r"venue", part, re.I):
+            continue
+        if re.fullmatch(r"\\+\\d+", part):
+            continue
+
+        key = part.casefold()
+        if key not in seen:
+            parts.append(part)
+            seen.add(key)
+
+    return ", ".join(parts)
+
+
 def parse_iso_date(value):
     if not value:
         return None
@@ -423,9 +465,9 @@ def fetch_event_details(session, item, browser_page):
         if not any(city.casefold() in part.casefold() for part in address_parts):
             address_parts.append(city_line)
 
-    venue_address = ", ".join(
+    venue_address = clean_venue_address(", ".join(
         part for part in address_parts if part
-    )
+    ))
 
     return {
         "Start": start,
