@@ -26,6 +26,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
 
       - name: Run OnTreasure scraper
         run: python scrape_ontreasure.py
