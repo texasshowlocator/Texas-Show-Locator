@@ -373,10 +373,15 @@ def fetch_event_details(session, item):
     # The structured data may contain a venue name but omit its street address.
     if not street or not venue or not address_text:
         fallback = extract_address_from_visible_text(soup)
-        if fallback and fallback.casefold() not in {
-            part.casefold() for part in (venue, street, address_text) if part
-        }:
-            address_text = fallback
+        if fallback:
+            # If the rendered location already includes the structured venue
+            # or street, keep the complete line instead of duplicating it.
+            if venue and venue.casefold() in fallback.casefold():
+                venue = ""
+            if street and street.casefold() in fallback.casefold():
+                street = ""
+            if fallback.casefold() != address_text.casefold():
+                address_text = fallback
 
     address_parts = []
 
