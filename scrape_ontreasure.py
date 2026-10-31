@@ -286,11 +286,35 @@ def extract_address_from_visible_text(soup):
         if clean_text(line)
     ]
 
-    # Prefer a street address immediately before a city/state/ZIP line.
+    # Treasure often renders the full venue and address on one line,
+    # ending in "TX, USA" without a ZIP code.
+    for line in lines:
+        if re.search(r",\s*(?:TX|Texas)(?:\s+\d{5}(?:-\d{4})?)?\s*,?\s*USA\b", line, re.I):
+            return line
+
+    # Some pages show the address as separate lines under "Event Location".
+    for index, line in enumerate(lines):
+        if "event location" in line.casefold():
+            section = []
+            remainder = re.sub(r"^.*?event location\s*:?", "", line, flags=re.I).strip()
+            if remainder:
+                section.append(remainder)
+
+            for candidate in lines[index + 1:index + 5]:
+                if candidate.casefold() in {"map unavailable on this device", "open the location in your maps app instead"}:
+                    break
+                section.append(candidate)
+                if re.search(r"\b(?:TX|Texas)\b", candidate, re.I):
+                    break
+
+            location_text = ", ".join(section)
+            if re.search(r"\b(?:TX|Texas)\b", location_text, re.I):
+                return location_text
+
+    # Last fallback: collect a street line and its following Texas city line.
     for index, line in enumerate(lines):
         if re.search(r",\s*(?:TX|Texas)\s+\d{5}\b", line, re.I):
-            parts = lines[max(0, index - 2):index + 1]
-            return ", ".join(parts)
+            return ", ".join(lines[max(0, index - 2):index + 1])
 
     return ""
 
@@ -345,9 +369,13 @@ def fetch_event_details(session, item):
     postal = structured.get("postal", "")
     address_text = structured.get("address_text", "")
 
-    if not street and not venue:
+    # Use rendered page content to fill missing venue/address fields.
+    # The structured data may contain a venue name but omit its street address.
+    if not street or not venue or not address_text:
         fallback = extract_address_from_visible_text(soup)
-        if fallback:
+        if fallback and fallback.casefold() not in {
+            part.casefold() for part in (venue, street, address_text) if part
+        }:
             address_text = fallback
 
     address_parts = []
