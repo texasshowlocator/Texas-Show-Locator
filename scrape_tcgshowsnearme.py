@@ -674,7 +674,7 @@ def write_audit(
         file.write(f"Source: {LISTING_URL}\n")
         file.write(f"Status: {status}\n")
         file.write(f"Website-reported event count: {expected}\n")
-        file.write(f"Unique Texas event links collected: {listing_count}\n")
+        file.write(f"Texas event records extracted from listing: {listing_count}\n")
         file.write(f"Listing pages read: {pages}\n")
         file.write(f"New events: {new_count}\n")
         file.write(f"Removed events: {removed_count}\n")
@@ -689,7 +689,7 @@ def write_audit(
             file.write(f"\nERROR:\n{error}\n")
 
         if detail_failures:
-            file.write("\nEVENT DETAIL PAGES THAT FAILED:\n")
+            file.write("\nLISTING CARDS SKIPPED / EXTRACTION ERRORS:\n")
             for failure in detail_failures:
                 file.write(f"- {failure}\n")
 
@@ -781,6 +781,7 @@ def main():
             pages=pages_read,
             new_count=new_count,
             removed_count=removed_count,
+            detail_failures=failures[:10],
             baseline=baseline,
         )
 
