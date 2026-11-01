@@ -524,6 +524,8 @@ def fetch_all_listing_events(page):
         f"{len(city_urls)} city-page URLs."
     )
 
+    blocked_city_pages = []
+
     for source_url in city_urls:
         response = page.goto(
             source_url,
@@ -531,17 +533,69 @@ def fetch_all_listing_events(page):
             timeout=REQUEST_TIMEOUT,
         )
         status_code = response.status if response else 200
+        successful_url = source_url
+
+        # A city can be published under either the /in/ or /pillar/ route.
+        # If one route is blocked, try its equivalent before giving up.
+        if status_code == 403:
+            parsed = urlparse(source_url)
+            alternate_path = parsed.path.replace(
+                "/events/in/usa/texas/",
+                "/events/pillar/usa/texas/",
+                1,
+            ) if "/events/in/usa/texas/" in parsed.path else parsed.path.replace(
+                "/events/pillar/usa/texas/",
+                "/events/in/usa/texas/",
+                1,
+            )
+            alternate_url = urlunparse(parsed._replace(path=alternate_path))
+            print(
+                f"City page returned HTTP 403; trying alternate route: "
+                f"{alternate_url}"
+            )
+            try:
+                alternate_response = page.goto(
+                    alternate_url,
+                    wait_until="domcontentloaded",
+                    timeout=REQUEST_TIMEOUT,
+                )
+                alternate_status = (
+                    alternate_response.status if alternate_response else 200
+                )
+                if alternate_status < 400:
+                    successful_url = alternate_url
+                    status_code = alternate_status
+                elif alternate_status == 404:
+                    print(
+                        f"Skipping city page with no alternate route: "
+                        f"{source_url}"
+                    )
+                    continue
+                else:
+                    status_code = alternate_status
+            except Exception as alternate_exc:
+                blocked_city_pages.append(
+                    f"{source_url} (HTTP 403); alternate {alternate_url} "
+                    f"failed: {alternate_exc}"
+                )
+                print(f"Could not access either route for {source_url}")
+                continue
 
         # Some inferred city slugs do not have a dedicated page. A 404 is
-        # expected for those; access errors and server errors are not ignored.
+        # expected for those. Keep scanning if an individual city is blocked,
+        # but fail the overall run after all cities have been attempted.
         if status_code == 404:
-            print(f"Skipping city page that does not exist: {source_url}")
+            print(f"Skipping city page that does not exist: {successful_url}")
             continue
         if status_code >= 400:
-            raise RuntimeError(
-                f"Texas city page returned HTTP {status_code}: {source_url}. "
-                "Previous snapshot will be preserved."
+            blocked_city_pages.append(
+                f"{successful_url} (HTTP {status_code})"
             )
+            print(
+                f"Skipping blocked city page and continuing: "
+                f"{successful_url} (HTTP {status_code})"
+            )
+            continue
 
         page.locator("body").wait_for(timeout=20000)
         soup = BeautifulSoup(page.content(), "html.parser")
@@ -584,6 +638,15 @@ def fetch_all_listing_events(page):
             f"({len(all_events)} total unique event links)."
         )
         time.sleep(PAGE_DELAY)
+
+    if blocked_city_pages:
+        detail = "\n".join(blocked_city_pages[:30])
+        raise RuntimeError(
+            f"{len(blocked_city_pages)} Texas city pages were blocked after "
+            "trying both supported URL patterns. All remaining city pages "
+            "were still checked. The previous snapshot was preserved. "
+            "Blocked pages:\n" + detail
+        )
 
     if failures:
         detail = "\n".join(failures[:20])
