@@ -17,7 +17,7 @@ from playwright.sync_api import sync_playwright
 # ============================================================
 
 BASE_URL = "https://tcgshowsnearme.com"
-LISTING_URL = f"{BASE_URL}/events/in/usa/texas"
+LISTING_URL = f"{BASE_URL}/events?region=TX&page=1"
 
 DATA_DIR = Path("data")
 OUTPUT_DIR = Path("output")
@@ -340,6 +340,102 @@ def extract_events_from_listing(page):
         )
 
     return events, failures
+
+
+def fetch_all_listing_events(page):
+    """
+    Read the Texas region's numbered listing pages (?region=TX&page=N).
+    Continue until a page contains no event links. A failed page raises an
+    error so an incomplete scrape never replaces the previous snapshot.
+    """
+    all_events = []
+    failures = []
+    seen_urls = set()
+    expected_count = None
+    pages_read = 0
+
+    for page_number in range(1, MAX_LISTING_PAGES + 1):
+        page_url = make_page_url(page_number)
+        print(f"Loading Texas event listing page {page_number}: {page_url}")
+
+        response = page.goto(
+            page_url,
+            wait_until="domcontentloaded",
+            timeout=REQUEST_TIMEOUT,
+        )
+        if response and response.status >= 400:
+            raise RuntimeError(
+                f"Texas listing page {page_number} returned HTTP {response.status}; "
+                "stopping to protect the previous snapshot."
+            )
+
+        page.locator("body").wait_for(timeout=20000)
+        soup = BeautifulSoup(page.content(), "html.parser")
+
+        if page_number == 1:
+            expected_count = extract_expected_count(soup)
+
+        anchors = [
+            anchor for anchor in soup.find_all("a", href=True)
+            if is_event_detail_url(clean_text(anchor.get("href")))
+        ]
+
+        if not anchors:
+            if page_number == 1:
+                raise RuntimeError(
+                    "No Texas event links found on the first region listing page."
+                )
+            print(f"No event links on page {page_number}; reached the end.")
+            break
+
+        page_urls = {
+            urljoin(BASE_URL, clean_text(anchor.get("href")).split("#", 1)[0])
+            for anchor in anchors
+        }
+        new_urls = page_urls - seen_urls
+
+        if not new_urls:
+            print(
+                f"Page {page_number} repeated previously seen event links; "
+                "stopping pagination."
+            )
+            break
+
+        seen_urls.update(new_urls)
+        pages_read = page_number
+
+        for anchor in anchors:
+            url = urljoin(
+                BASE_URL,
+                clean_text(anchor.get("href")).split("#", 1)[0],
+            )
+            if url not in new_urls:
+                continue
+            try:
+                all_events.append(extract_listing_event(anchor))
+            except Exception as exc:
+                failures.append(f"{url} | {exc}")
+
+        print(
+            f"Page {page_number}: {len(anchors)} event links, "
+            f"{len(new_urls)} new links, {len(all_events)} parsed records total."
+        )
+
+        if page_number == MAX_LISTING_PAGES:
+            raise RuntimeError(
+                f"Reached MAX_LISTING_PAGES={MAX_LISTING_PAGES}. "
+                "The listing may contain more pages; snapshot was not updated."
+            )
+
+        time.sleep(PAGE_DELAY)
+
+    if not all_events:
+        detail = "; ".join(failures[:5])
+        raise RuntimeError(
+            "No Texas event records could be extracted. " + detail
+        )
+
+    return all_events, failures, expected_count, pages_read
 
 
 # ============================================================
@@ -732,24 +828,19 @@ def main():
             page = context.new_page()
 
             try:
-                response = page.goto(
-                    LISTING_URL,
-                    wait_until="domcontentloaded",
-                    timeout=REQUEST_TIMEOUT,
+                events, failures, expected_count, pages_read = (
+                    fetch_all_listing_events(page)
                 )
-                if response and response.status >= 400:
-                    raise RuntimeError(
-                        f"Texas statewide listing returned HTTP {response.status}"
-                    )
-                page.locator("body").wait_for(timeout=20000)
-                soup = BeautifulSoup(page.content(), "html.parser")
-                expected_count = extract_expected_count(soup)
-                pages_read = 1
-                events, failures = extract_events_from_listing(page)
                 listings = [{"url": "", "name": row["Event"]} for row in events]
-                print(f"Extracted {len(events)} event records directly from the listing.")
+                print(
+                    f"Extracted {len(events)} event records across "
+                    f"{pages_read} Texas listing pages."
+                )
                 if failures:
-                    print(f"Listing cards skipped because fields were incomplete: {len(failures)}")
+                    print(
+                        "Listing cards skipped because fields were incomplete: "
+                        f"{len(failures)}"
+                    )
             finally:
                 browser.close()
 
