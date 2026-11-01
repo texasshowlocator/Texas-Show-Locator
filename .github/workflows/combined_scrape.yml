@@ -2,7 +2,10 @@ name: Combined Texas Show Locator Report
 
 on:
   schedule:
-    - cron: "30 14 * * *"
+    # GitHub cron uses UTC. Trigger at both possible 7 PM Central UTC offsets,
+    # then run the scraper job only when the Chicago local hour is 19.
+    - cron: "0 0 * * *"
+    - cron: "0 1 * * *"
   workflow_dispatch:
 
 permissions:
@@ -13,7 +16,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  schedule-check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.local-time.outputs.should_run }}
+    steps:
+      - name: Check Central time
+        id: local-time
+        run: |
+          CENTRAL_HOUR="$(TZ=America/Chicago date +'%H')"
+          if [ "$CENTRAL_HOUR" = "19" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
   scrape-and-combine:
+    needs: schedule-check
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.schedule-check.outputs.should_run == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
