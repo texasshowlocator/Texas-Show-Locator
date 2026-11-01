@@ -576,6 +576,11 @@ def main():
     print("TEXAS SHOW LOCATOR - TCG SHOWS NEAR ME SCRAPER")
     print("=" * 65)
 
+    listings = []
+    expected_count = None
+    pages_read = 0
+    failures = []
+
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
@@ -590,7 +595,6 @@ def main():
                 print(f"Unique event links collected: {len(listings)}")
 
                 events = []
-                failures = []
 
                 for index, listing in enumerate(listings, start=1):
                     label = listing["name"] or listing["url"]
@@ -602,13 +606,19 @@ def main():
                     except Exception as exc:
                         failures.append(f"{label} | {listing['url']} | {exc}")
                         print(f"  FAILED: {exc}")
+                        # Stop after three failures so a blocked detail route
+                        # does not waste time requesting every remaining event.
+                        if len(failures) >= 3:
+                            print("Stopping after three detail-page failures.")
+                            break
                     time.sleep(DETAIL_DELAY)
             finally:
                 browser.close()
 
         if failures:
             raise RuntimeError(
-                f"{len(failures)} of {len(listings)} event detail pages failed. "
+                f"{len(failures)} event detail page(s) failed "
+                f"(stopped early; {len(listings)} links were collected). "
                 "The master report and previous snapshot were preserved."
             )
 
@@ -680,6 +690,10 @@ def main():
         print("Previous snapshot and reports were not updated.")
         write_audit(
             status="FAILED - SNAPSHOT PRESERVED",
+            expected=expected_count,
+            listing_count=len(listings),
+            pages=pages_read,
+            detail_failures=failures[:10],
             error=message,
         )
         sys.exit(1)
