@@ -218,8 +218,8 @@ def fetch_all_listing_links(page):
 
         if (
             parsed.netloc.casefold() not in ("tcgshowsnearme.com", "www.tcgshowsnearme.com")
-            or len(path_parts) != 6
-            or path_parts[:5] != ["events", "pillar", "usa", "texas", path_parts[4]]
+            or len(path_parts) != 5
+            or path_parts[:4] != ["events", "pillar", "usa", "texas"]
         ):
             continue
 
