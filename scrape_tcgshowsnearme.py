@@ -226,8 +226,8 @@ def extract_listing_event(anchor):
         r"September|October|November|December)"
     )
     date_re = re.compile(
-        rf"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\\s+{month}\\s+"
-        r"\\d{1,2},?\\s+\\d{4}",
+        rf"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+{month}\s+"
+        r"\d{1,2},?\s+\d{4}",
         re.IGNORECASE,
     )
 
@@ -237,7 +237,7 @@ def extract_listing_event(anchor):
         if node is None:
             break
         text = clean_text(node.get_text(" ", strip=True))
-        if date_re.search(text) and re.search(r"\\b(?:TX|Texas)\\b", text, re.I):
+        if date_re.search(text) and re.search(r"\b(?:TX|Texas)\b", text, re.I):
             if len(text) <= 1800:
                 candidates.append((len(text), node, text))
         node = node.parent
@@ -248,7 +248,7 @@ def extract_listing_event(anchor):
     _, card, card_text = min(candidates, key=lambda item: item[0])
     lines = [
         clean_text(line)
-        for line in card.get_text("\\n", strip=True).splitlines()
+        for line in card.get_text("\n", strip=True).splitlines()
         if clean_text(line)
     ]
 
@@ -274,7 +274,7 @@ def extract_listing_event(anchor):
     # line. If only a city/state line is available, retain it as the location.
     state_index = next(
         (i for i, line in enumerate(lines)
-         if re.search(r"\\b(?:TX|Texas)\\b", line, re.I)),
+         if re.search(r"\b(?:TX|Texas)\b", line, re.I)),
         None,
     )
     if state_index is None:
@@ -284,7 +284,7 @@ def extract_listing_event(anchor):
     for line in lines[max(0, state_index - 2):state_index + 1]:
         if line.casefold() in {"united states", "usa"}:
             continue
-        if date_re.search(line) or re.match(r"^\\d{1,2}:\\d{2}", line):
+        if date_re.search(line) or re.match(r"^\d{1,2}:\d{2}", line):
             continue
         if line not in location_lines:
             location_lines.append(line)
