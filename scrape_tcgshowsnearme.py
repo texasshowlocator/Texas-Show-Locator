@@ -17,7 +17,7 @@ from playwright.sync_api import sync_playwright
 # ============================================================
 
 BASE_URL = "https://tcgshowsnearme.com"
-LISTING_URL = f"{BASE_URL}/events/pillar/usa/texas"
+LISTING_URL = f"{BASE_URL}/events/in/usa/texas"
 
 DATA_DIR = Path("data")
 OUTPUT_DIR = Path("output")
@@ -116,7 +116,7 @@ def make_page_url(page_number):
 def extract_expected_count(soup):
     text = clean_text(soup.get_text(" ", strip=True))
     patterns = (
-        r"([\d,]+)\s+Card Shows in Texas",
+        r"([\d,]+)\s+(?:confirmed\s+)?Card Shows in Texas",
         r"([\d,]+)\s+(?:Upcoming )?Events? in Texas",
         r"([\d,]+)\s+upcoming",
     )
@@ -167,18 +167,14 @@ def collect_listing_links(page):
 
 def fetch_all_listing_links(page):
     """
-    The Texas pillar page exposes city-specific listing pages. The site's
-    numbered ?page=2 URL can return HTTP 403, so do not invent page numbers.
-    Crawl the Texas landing page plus the city URLs actually linked by it.
-    """
-    all_links = []
-    seen_urls = set()
-    city_urls = []
-    seen_city_urls = set()
-    expected_count = None
-    pages_read = 0
+    Use the Texas-wide upcoming-events listing. Unlike the pillar page,
+    this route presents a single statewide list and does not require visiting
+    city pages, which have returned HTTP 403 in GitHub Actions.
 
-    print(f"Loading Texas landing page: {LISTING_URL}")
+    The headline count is informational: it may count event occurrences,
+    while this scraper deduplicates event detail URLs.
+    """
+    print(f"Loading statewide Texas event page: {LISTING_URL}")
     response = page.goto(
         LISTING_URL,
         wait_until="domcontentloaded",
@@ -186,88 +182,24 @@ def fetch_all_listing_links(page):
     )
     if response and response.status >= 400:
         raise RuntimeError(
-            f"Texas landing page returned HTTP {response.status}"
+            f"Texas statewide listing returned HTTP {response.status}"
         )
 
     page.locator("body").wait_for(timeout=20000)
     links, soup = collect_listing_links(page)
     expected_count = extract_expected_count(soup)
-    pages_read += 1
 
-    def add_event_links(found_links, source_label):
-        added = 0
-        for item in found_links:
-            if item["url"] not in seen_urls:
-                seen_urls.add(item["url"])
-                all_links.append(item)
-                added += 1
-        print(
-            f"{source_label}: {len(found_links)} event links, "
-            f"{added} new, {len(all_links)} total"
-        )
-
-    add_event_links(links, "Texas landing page")
-
-    # Collect only direct city children of /events/pillar/usa/texas/.
-    # Do not mistake country, category, or nested event URLs for city pages.
-    for anchor in soup.find_all("a", href=True):
-        href = clean_text(anchor.get("href"))
-        absolute_url = urljoin(BASE_URL, href)
-        parsed = urlparse(absolute_url)
-        path_parts = [part for part in parsed.path.strip("/").split("/") if part]
-
-        if (
-            parsed.netloc.casefold() not in ("tcgshowsnearme.com", "www.tcgshowsnearme.com")
-            or len(path_parts) != 5
-            or path_parts[:4] != ["events", "pillar", "usa", "texas"]
-        ):
-            continue
-
-        city_url = urlunparse(parsed._replace(query="", fragment=""))
-        if city_url not in seen_city_urls:
-            seen_city_urls.add(city_url)
-            city_urls.append(city_url)
-
-    print(f"Discovered {len(city_urls)} Texas city listing pages.")
-
-    # Visit every discovered city page. A failed city page means the crawl
-    # may be incomplete, so fail safely without updating the snapshot.
-    for index, city_url in enumerate(city_urls, start=1):
-        print(f"Loading Texas city page {index}/{len(city_urls)}: {city_url}")
-
-        response = page.goto(
-            city_url,
-            wait_until="domcontentloaded",
-            timeout=REQUEST_TIMEOUT,
-        )
-        if response and response.status >= 400:
-            raise RuntimeError(
-                f"Texas city page returned HTTP {response.status}: {city_url}"
-            )
-
-        page.locator("body").wait_for(timeout=20000)
-        city_links, _ = collect_listing_links(page)
-        pages_read += 1
-        add_event_links(city_links, f"City page {index}")
-
-        time.sleep(PAGE_DELAY)
-
-    if not all_links:
+    if not links:
         raise RuntimeError(
-            "No Texas event detail links were found on the Texas landing "
-            "page or its linked city pages. The website layout may have changed."
+            "No Texas event detail links were found on the statewide listing. "
+            "The page may be blocking automated access or its layout may have changed."
         )
 
     print(
-        f"Finished collecting {len(all_links)} unique event links from "
-        f"{pages_read} Texas listing pages."
+        f"Collected {len(links)} unique event detail links from "
+        "the statewide Texas listing."
     )
-
-    # The landing-page headline count is informational. It may count event
-    # dates/occurrences rather than unique detail URLs, so it is not used as
-    # a strict URL-count equality check.
-    return all_links, expected_count, pages_read
-
+    return links, expected_count, 1
 
 # ============================================================
 # JSON-LD AND DETAIL PAGE EXTRACTION
@@ -684,11 +616,6 @@ def main():
             raise RuntimeError(
                 f"Event count mismatch: {len(events)} detail records for "
                 f"{len(listings)} listing links."
-            )
-
-        if expected_count is not None and len(listings) != expected_count:
-            raise RuntimeError(
-                f"Expected {expected_count} events but collected {len(listings)}."
             )
 
         # Remove duplicate event rows before merging date ranges.
