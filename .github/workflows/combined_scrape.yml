@@ -1,0 +1,66 @@
+name: Combined Texas Show Locator Report
+
+on:
+  schedule:
+    - cron: "30 14 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: combined-texas-show-report
+  cancel-in-progress: false
+
+jobs:
+  scrape-and-combine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run TCDB scraper
+        run: python scrape_tcdb.py
+
+      - name: Run OnTreasure scraper
+        run: python scrape_ontreasure.py
+
+      - name: Build combined CSV report
+        run: python combine_scraper_reports.py
+
+      - name: Commit updated source snapshots
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/previous_snapshot.csv data/ontreasure_previous_snapshot.csv
+          git diff --cached --quiet || git commit -m "Update TCDB and OnTreasure event snapshots"
+          git push
+
+      - name: Upload combined and individual reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: texas-show-locator-combined-reports
+          path: |
+            output/combined_texas_card_shows.csv
+            output/texas_card_shows.csv
+            output/ontreasure_events.csv
+            output/daily_changes.csv
+            output/ontreasure_daily_changes.csv
+            output/scrape_audit.txt
+            output/ontreasure_scrape_audit.txt
+          if-no-files-found: warn
+          retention-days: 30
