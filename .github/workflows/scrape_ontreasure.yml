@@ -1,8 +1,6 @@
 name: OnTreasure Texas Events Scraper
 
 on:
-  schedule:
-    - cron: "30 13 * * *"
   workflow_dispatch:
 
 permissions:
