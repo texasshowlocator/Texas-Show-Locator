@@ -216,6 +216,30 @@ def is_event_detail_url(href):
     return not any(path.startswith(item) for item in excluded)
 
 
+def debug_card_structure(anchor):
+    """Describe the actual listing DOM around a link when card detection fails."""
+    details = []
+    details.append(
+        "ANCHOR TEXT: " + clean_text(anchor.get_text(" ", strip=True))[:900]
+    )
+    node = anchor
+    for level in range(35):
+        if node is None:
+            break
+        if getattr(node, "name", None):
+            classes = node.get("class", [])
+            if isinstance(classes, list):
+                classes = " ".join(classes)
+            node_text = clean_text(node.get_text(" ", strip=True))
+            details.append(
+                f"PARENT {level}: <{node.name}> "
+                f"class={str(classes)[:180]!r} id={str(node.get('id', ''))[:100]!r} "
+                f"text_len={len(node_text)} text={node_text[:650]!r}"
+            )
+        node = node.parent
+    return " || ".join(details)
+
+
 def extract_listing_event(anchor):
     """
     Extract one event occurrence from its listing card. Detail pages are
@@ -243,7 +267,11 @@ def extract_listing_event(anchor):
         node = node.parent
 
     if not candidates:
-        raise ValueError("Could not find a complete Texas event card in the listing")
+        diagnostic = debug_card_structure(anchor)
+        raise ValueError(
+            "Could not find a complete Texas event card in the listing. DOM DIAGNOSTIC: "
+            + diagnostic
+        )
 
     _, card, card_text = min(candidates, key=lambda item: item[0])
     lines = [
