@@ -415,9 +415,10 @@ def extract_events_from_listing(page):
 
 def fetch_all_listing_events(page):
     """
-    Fetch the statewide Texas landing page, then each Texas city page linked
-    from its Browse by City section. City pages expose older and much later
-    future events that are not all included in the statewide first screen.
+    Fetch the statewide Texas listing, all linked Texas city pages, and
+    additional city pillar pages inferred from event locations. The city
+    pages contain recurring/future events that may not appear in the
+    statewide listing's initial event set.
     """
     all_events = []
     failures = []
@@ -439,29 +440,85 @@ def fetch_all_listing_events(page):
     expected_count = extract_expected_count(main_soup)
 
     city_urls = []
+    city_slugs = set()
+
+    # Use explicitly linked city pages where available.
     for anchor in main_soup.find_all("a", href=True):
         href = clean_text(anchor.get("href"))
         absolute = urljoin(BASE_URL, href)
         parsed_path = urlparse(absolute).path.rstrip("/")
-        prefix = "/events/in/usa/texas/"
-        if parsed_path.startswith(prefix) and parsed_path != "/events/in/usa/texas":
-            if absolute not in city_urls:
-                city_urls.append(absolute)
+        for prefix in (
+            "/events/in/usa/texas/",
+            "/events/pillar/usa/texas/",
+        ):
+            if parsed_path.startswith(prefix):
+                slug = parsed_path[len(prefix):].strip("/")
+                if slug:
+                    city_slugs.add(slug)
+                    if absolute not in city_urls:
+                        city_urls.append(absolute)
 
-    source_urls = [LISTING_URL] + city_urls
-    print(f"Discovered {len(city_urls)} Texas city pages from the statewide listing.")
+    # Parse statewide cards and infer additional city pages from their
+    # Texas city/state text. This discovers pages such as Waco's pillar route.
+    for anchor in main_soup.find_all("a", href=True):
+        href = clean_text(anchor.get("href"))
+        if not is_event_detail_url(href):
+            continue
+        event_url = urljoin(BASE_URL, href.split("#", 1)[0])
+        if event_url in visited_urls:
+            continue
+        try:
+            event = extract_listing_event(anchor)
+            visited_urls.add(event_url)
+            all_events.append(event)
 
-    for source_url in source_urls:
+            city_matches = re.findall(
+                r"([A-Za-z][A-Za-z .'-]+),\s*(?:TX|Texas)\b",
+                event["Venue/Address"],
+                re.IGNORECASE,
+            )
+            if city_matches:
+                city = clean_text(city_matches[-1])
+                slug = re.sub(r"[^a-z0-9]+", "-", city.casefold()).strip("-")
+                if slug:
+                    city_slugs.add(slug)
+        except Exception as exc:
+            failures.append(f"{LISTING_URL} | {event_url} | {exc}")
+
+    # Keep the exact routes linked by the site, then add pillar routes for
+    # cities discovered in event addresses. Waco and some other city pages
+    # use the /events/pillar/ route rather than /events/in/.
+    known_slugs = {
+        urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+        for url in city_urls
+    }
+    for slug in sorted(city_slugs - known_slugs):
+        city_urls.append(f"{BASE_URL}/events/pillar/usa/texas/{slug}")
+
+    print(
+        f"Discovered {len(city_slugs)} Texas city slugs and "
+        f"{len(city_urls)} city-page URLs."
+    )
+
+    for source_url in city_urls:
         response = page.goto(
             source_url,
             wait_until="domcontentloaded",
             timeout=REQUEST_TIMEOUT,
         )
-        if response and response.status >= 400:
+        status_code = response.status if response else 200
+
+        # Some inferred city slugs do not have a dedicated page. A 404 is
+        # expected for those; access errors and server errors are not ignored.
+        if status_code == 404:
+            print(f"Skipping city page that does not exist: {source_url}")
+            continue
+        if status_code >= 400:
             raise RuntimeError(
-                f"Texas source page returned HTTP {response.status}: {source_url}. "
+                f"Texas city page returned HTTP {status_code}: {source_url}. "
                 "Previous snapshot will be preserved."
             )
+
         page.locator("body").wait_for(timeout=20000)
         soup = BeautifulSoup(page.content(), "html.parser")
         pages_read += 1
@@ -480,12 +537,22 @@ def fetch_all_listing_events(page):
                 visited_urls.add(event_url)
                 all_events.append(event)
                 page_events += 1
+
+                city_matches = re.findall(
+                    r"([A-Za-z][A-Za-z .'-]+),\s*(?:TX|Texas)\b",
+                    event["Venue/Address"],
+                    re.IGNORECASE,
+                )
+                if city_matches:
+                    city = clean_text(city_matches[-1])
+                    slug = re.sub(r"[^a-z0-9]+", "-", city.casefold()).strip("-")
+                    if slug:
+                        city_slugs.add(slug)
             except Exception as exc:
-                # Leave failed links eligible for a richer city-page card.
                 failures.append(f"{source_url} | {event_url} | {exc}")
 
         print(
-            f"Read {source_url}: {page_events} event records parsed "
+            f"Read {source_url}: {page_events} new event records "
             f"({len(all_events)} total unique event links)."
         )
         time.sleep(PAGE_DELAY)
