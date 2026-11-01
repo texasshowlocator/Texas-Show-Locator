@@ -17,7 +17,7 @@ from playwright.sync_api import sync_playwright
 # ============================================================
 
 BASE_URL = "https://tcgshowsnearme.com"
-LISTING_URL = f"{BASE_URL}/events?region=TX&page=1"
+LISTING_URL = f"{BASE_URL}/events/in/usa/texas"
 
 DATA_DIR = Path("data")
 OUTPUT_DIR = Path("output")
@@ -240,60 +240,125 @@ def debug_card_structure(anchor):
     return " || ".join(details)
 
 
-def extract_listing_event(anchor):
-    """
-    Parse the complete event record from the event link itself.
-    The Texas listing renders the title, host, date, time, venue and address
-    inside one <a class="block"> element rather than a separate card wrapper.
-    """
-    text = clean_text(anchor.get_text(" ", strip=True))
-
-    month = (
+def parse_listing_dates(text):
+    """Parse a single date or a weekday/month date range from a listing card."""
+    month_pattern = (
         r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
         r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|"
         r"Nov(?:ember)?|Dec(?:ember)?)"
     )
-    date_re = re.compile(
-        rf"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+{month}\s+"
-        r"\d{1,2},?\s+\d{4}",
+    date_pattern = re.compile(
+        rf"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+"
+        rf"(?P<month>{month_pattern})\s+(?P<day>\d{{1,2}})"
+        rf"(?:,?\s+(?P<year>\d{{4}}))?",
         re.IGNORECASE,
     )
-    date_match = date_re.search(text)
-    if not date_match:
-        raise ValueError("Could not parse abbreviated event date from event link")
+    matches = list(date_pattern.finditer(text))
+    if not matches:
+        return None, None, None
 
-    start = parse_date(date_match.group(0))
-    if not start:
-        raise ValueError("Could not convert event date from event link")
+    first = matches[0]
+    second = None
+    if len(matches) > 1:
+        between = text[first.end():matches[1].start()]
+        if re.search(r"[-–—]|\bto\b", between, re.IGNORECASE):
+            second = matches[1]
 
-    # The event name precedes the "Hosted by" label in the listing text.
-    before_date = text[:date_match.start()].strip()
+    def make_date(match, default_year=None):
+        year = int(match.group("year")) if match.group("year") else default_year
+        if year is None:
+            return None
+        month_name = match.group("month")[:3].title()
+        month_number = datetime.strptime(month_name, "%b").month
+        return datetime(year, month_number, int(match.group("day")))
+
+    if second:
+        end_year = int(second.group("year")) if second.group("year") else (
+            int(first.group("year")) if first.group("year") else None
+        )
+        start_year = int(first.group("year")) if first.group("year") else end_year
+        if start_year is None:
+            return None, None, first
+        start_date = make_date(first, start_year)
+        end_date = make_date(second, end_year)
+        if end_date and start_date and end_date < start_date and not first.group("year"):
+            start_date = make_date(first, end_year - 1)
+        return start_date, end_date, first
+
+    year = int(first.group("year")) if first.group("year") else None
+    if year is None:
+        return None, None, first
+    single = make_date(first, year)
+    return single, single, first
+
+
+def extract_listing_event(anchor):
+    """
+    Extract an event from the nearest card-like ancestor containing its date,
+    time and Texas location. The live Texas page uses both multi-line cards
+    and compact one-line cards, so parsing only the anchor text is insufficient.
+    """
+    href = clean_text(anchor.get("href"))
+    node = anchor
+    card_text = ""
+    for _ in range(10):
+        if node is None or not getattr(node, "name", None):
+            break
+        candidate = node.get_text(" ", strip=True)
+        candidate = clean_text(candidate)
+        has_date = re.search(
+            r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+"
+            r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)",
+            candidate,
+            re.IGNORECASE,
+        )
+        has_time = re.search(
+            r"\d{1,2}:\d{2}\s*(?:AM|PM)?\s*[-–]\s*\d{1,2}:\d{2}",
+            candidate,
+            re.IGNORECASE,
+        )
+        has_texas = re.search(r"\b(?:TX|Texas)\b", candidate, re.IGNORECASE)
+        if has_date and has_time and has_texas and len(candidate) <= 3500:
+            card_text = candidate
+            break
+        node = node.parent
+
+    if not card_text:
+        raise ValueError("Could not find a card containing date, time and Texas location")
+
+    start_date, end_date, date_match = parse_listing_dates(card_text)
+    if not start_date or not end_date:
+        raise ValueError("Could not parse complete event date or date range")
+
+    date_start = date_match.start()
+    before_date = card_text[:date_start].strip()
     name = re.split(r"\s+Hosted by\s+", before_date, maxsplit=1, flags=re.I)[0]
     name = clean_text(name)
+    name = re.sub(r"^(?:Featured\s+)+", "", name, flags=re.I).strip()
     if not name:
-        raise ValueError("Could not determine event name from event link")
+        # Some cards put the event name after the date; fall back to the
+        # anchor's visible text before the host label.
+        anchor_text = clean_text(anchor.get_text(" ", strip=True))
+        name = re.split(r"\s+Hosted by\s+", anchor_text, maxsplit=1, flags=re.I)[0]
+    if not name:
+        raise ValueError("Could not determine event name")
 
-    # The time range follows the date. Location starts immediately afterward.
     time_match = re.search(
         r"\d{1,2}:\d{2}\s*(?:AM|PM)?\s*[-–]\s*"
         r"\d{1,2}:\d{2}\s*(?:AM|PM)?",
-        text[date_match.end():],
+        card_text[date_match.end():],
         re.IGNORECASE,
     )
     if not time_match:
-        raise ValueError(f"Could not locate event time and address for {name}")
+        raise ValueError(f"Could not locate event time for {name}")
 
-    location_start = date_match.end() + time_match.end()
-    location_text = text[location_start:].strip()
-
-    # Listing cards append promotional tags after the address. Remove those
-    # tags while preserving the venue, street address and city/state.
+    location_text = card_text[date_match.end() + time_match.end():].strip()
     feature_re = re.compile(
         r"\s+(?:Trade Night|"
         r"\d+\+?\s+Vendors?|"
-        r"Free Entry|Free Parking|Free for Kids|"
+        r"Free Entry|Free Parking|Free for Kids|Free Admission(?: for Kids)?|"
         r"Prize Draw|Giveaway|Tournament|Tournaments|"
-        r"Early Bird|Door Prizes|Admission|"
+        r"Early Bird|Door Prizes|Admission|Entry|"
         r"\$\s*\d+(?:\.\d{2})?).*$",
         re.IGNORECASE,
     )
@@ -301,17 +366,15 @@ def extract_listing_event(anchor):
 
     if not re.search(r"\b(?:TX|Texas)\b", location_text, re.IGNORECASE):
         raise ValueError(f"Could not verify Texas location for {name}")
-
     if not location_text:
         raise ValueError(f"Could not extract venue/address for {name}")
 
     return {
-        "Start": start,
-        "End": start,
+        "Start": start_date.strftime("%m/%d/%y"),
+        "End": end_date.strftime("%m/%d/%y"),
         "Event": name,
         "Venue/Address": location_text,
     }
-
 
 def extract_events_from_listing(page):
     soup = BeautifulSoup(page.content(), "html.parser")
@@ -344,95 +407,85 @@ def extract_events_from_listing(page):
 
 def fetch_all_listing_events(page):
     """
-    Read the Texas region's numbered listing pages (?region=TX&page=N).
-    Continue until a page contains no event links. A failed page raises an
-    error so an incomplete scrape never replaces the previous snapshot.
+    Fetch the statewide Texas landing page, then each Texas city page linked
+    from its Browse by City section. City pages expose older and much later
+    future events that are not all included in the statewide first screen.
     """
     all_events = []
     failures = []
-    seen_urls = set()
+    visited_urls = set()
     expected_count = None
     pages_read = 0
 
-    for page_number in range(1, MAX_LISTING_PAGES + 1):
-        page_url = make_page_url(page_number)
-        print(f"Loading Texas event listing page {page_number}: {page_url}")
+    response = page.goto(
+        LISTING_URL,
+        wait_until="domcontentloaded",
+        timeout=REQUEST_TIMEOUT,
+    )
+    if response and response.status >= 400:
+        raise RuntimeError(
+            f"Texas statewide listing returned HTTP {response.status}"
+        )
+    page.locator("body").wait_for(timeout=20000)
+    main_soup = BeautifulSoup(page.content(), "html.parser")
+    expected_count = extract_expected_count(main_soup)
 
+    city_urls = []
+    for anchor in main_soup.find_all("a", href=True):
+        href = clean_text(anchor.get("href"))
+        absolute = urljoin(BASE_URL, href)
+        parsed_path = urlparse(absolute).path.rstrip("/")
+        prefix = "/events/in/usa/texas/"
+        if parsed_path.startswith(prefix) and parsed_path != "/events/in/usa/texas":
+            if absolute not in city_urls:
+                city_urls.append(absolute)
+
+    source_urls = [LISTING_URL] + city_urls
+    print(f"Discovered {len(city_urls)} Texas city pages from the statewide listing.")
+
+    for source_url in source_urls:
         response = page.goto(
-            page_url,
+            source_url,
             wait_until="domcontentloaded",
             timeout=REQUEST_TIMEOUT,
         )
         if response and response.status >= 400:
             raise RuntimeError(
-                f"Texas listing page {page_number} returned HTTP {response.status}; "
-                "stopping to protect the previous snapshot."
+                f"Texas source page returned HTTP {response.status}: {source_url}. "
+                "Previous snapshot will be preserved."
             )
-
         page.locator("body").wait_for(timeout=20000)
         soup = BeautifulSoup(page.content(), "html.parser")
+        pages_read += 1
 
-        if page_number == 1:
-            expected_count = extract_expected_count(soup)
-
-        anchors = [
-            anchor for anchor in soup.find_all("a", href=True)
-            if is_event_detail_url(clean_text(anchor.get("href")))
-        ]
-
-        if not anchors:
-            if page_number == 1:
-                raise RuntimeError(
-                    "No Texas event links found on the first region listing page."
-                )
-            print(f"No event links on page {page_number}; reached the end.")
-            break
-
-        page_urls = {
-            urljoin(BASE_URL, clean_text(anchor.get("href")).split("#", 1)[0])
-            for anchor in anchors
-        }
-        new_urls = page_urls - seen_urls
-
-        if not new_urls:
-            print(
-                f"Page {page_number} repeated previously seen event links; "
-                "stopping pagination."
-            )
-            break
-
-        seen_urls.update(new_urls)
-        pages_read = page_number
-
-        for anchor in anchors:
-            url = urljoin(
-                BASE_URL,
-                clean_text(anchor.get("href")).split("#", 1)[0],
-            )
-            if url not in new_urls:
+        page_events = 0
+        for anchor in soup.find_all("a", href=True):
+            href = clean_text(anchor.get("href"))
+            if not is_event_detail_url(href):
                 continue
+            event_url = urljoin(BASE_URL, href.split("#", 1)[0])
+            if event_url in visited_urls:
+                continue
+            visited_urls.add(event_url)
+
             try:
-                all_events.append(extract_listing_event(anchor))
+                event = extract_listing_event(anchor)
+                all_events.append(event)
+                page_events += 1
             except Exception as exc:
-                failures.append(f"{url} | {exc}")
+                failures.append(f"{source_url} | {event_url} | {exc}")
 
         print(
-            f"Page {page_number}: {len(anchors)} event links, "
-            f"{len(new_urls)} new links, {len(all_events)} parsed records total."
+            f"Read {source_url}: {page_events} event records parsed "
+            f"({len(all_events)} total unique event links)."
         )
-
-        if page_number == MAX_LISTING_PAGES:
-            raise RuntimeError(
-                f"Reached MAX_LISTING_PAGES={MAX_LISTING_PAGES}. "
-                "The listing may contain more pages; snapshot was not updated."
-            )
-
         time.sleep(PAGE_DELAY)
 
     if not all_events:
-        detail = "; ".join(failures[:5])
+        detail = "; ".join(failures[:8])
         raise RuntimeError(
-            "No Texas event records could be extracted. " + detail
+            "No Texas event records could be extracted from the statewide "
+            "or city listings. " + detail
         )
 
     return all_events, failures, expected_count, pages_read
@@ -834,7 +887,7 @@ def main():
                 listings = [{"url": "", "name": row["Event"]} for row in events]
                 print(
                     f"Extracted {len(events)} event records across "
-                    f"{pages_read} Texas listing pages."
+                    f"{pages_read} Texas listing and city pages."
                 )
                 if failures:
                     print(
@@ -891,7 +944,7 @@ def main():
         print("TCG SHOWS NEAR ME SCRAPE COMPLETED SUCCESSFULLY")
         print("=" * 65)
         print(f"Website-reported events: {expected_count}")
-        print(f"Event detail pages processed: {len(events)}")
+        print(f"Event records before date merging: {len(events)}")
         print(f"Rows after date merging: {len(events)}")
         print(f"New events: {new_count}")
         print(f"Removed events: {removed_count}")
