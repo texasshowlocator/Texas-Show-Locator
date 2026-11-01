@@ -285,6 +285,29 @@ def parse_listing_dates(text):
             start_date = make_date(first, end_year - 1)
         return start_date, end_date, first
 
+    # Some cards abbreviate the second date, e.g. "Sat, Feb 6, 2027 - Feb 7".
+    tail = text[first.end():first.end() + 40]
+    short_range = re.match(
+        rf"\s*[-–—]\s*(?:(?P<month>{month_pattern})\s+)?"
+        r"(?P<day>\d{1,2})(?:,?\s*(?P<year>\d{4}))?",
+        tail,
+        re.IGNORECASE,
+    )
+    if short_range:
+        year = int(first.group("year")) if first.group("year") else (
+            int(short_range.group("year")) if short_range.group("year") else None
+        )
+        if year is None:
+            return None, None, first
+        start_date = make_date(first, year)
+        month_name = short_range.group("month") or first.group("month")
+        end_year = int(short_range.group("year")) if short_range.group("year") else year
+        month_number = datetime.strptime(month_name[:3].title(), "%b").month
+        end_date = datetime(end_year, month_number, int(short_range.group("day")))
+        if end_date < start_date and not short_range.group("year"):
+            end_date = datetime(end_year + 1, month_number, int(short_range.group("day")))
+        return start_date, end_date, first
+
     year = int(first.group("year")) if first.group("year") else None
     if year is None:
         return None, None, first
@@ -366,7 +389,7 @@ def extract_listing_event(anchor):
         r"\d+\+?\s+Vendors?|"
         r"Free Entry|Free Parking|Free for Kids|Free Admission(?: for Kids)?|"
         r"Prize Draw|Giveaway|Tournament|Tournaments|"
-        r"Early Bird|Door Prizes|Admission|Entry|"
+        r"Early Bird|Door Prizes|Admission|Entry|Price not confirmed|See website for pricing|"
         r"\$\s*\d+(?:\.\d{2})?).*$",
         re.IGNORECASE,
     )
@@ -438,6 +461,7 @@ def fetch_all_listing_events(page):
     page.locator("body").wait_for(timeout=20000)
     main_soup = BeautifulSoup(page.content(), "html.parser")
     expected_count = extract_expected_count(main_soup)
+    pages_read = 1
 
     city_urls = []
     city_slugs = set()
@@ -535,6 +559,10 @@ def fetch_all_listing_events(page):
             try:
                 event = extract_listing_event(anchor)
                 visited_urls.add(event_url)
+                failures = [
+                    failure for failure in failures
+                    if event_url not in failure
+                ]
                 all_events.append(event)
                 page_events += 1
 
