@@ -233,12 +233,12 @@ def extract_listing_event(anchor):
 
     candidates = []
     node = anchor
-    for _ in range(7):
+    for _ in range(20):
         if node is None:
             break
         text = clean_text(node.get_text(" ", strip=True))
         if date_re.search(text) and re.search(r"\b(?:TX|Texas)\b", text, re.I):
-            if len(text) <= 1800:
+            if len(text) <= 4000:
                 candidates.append((len(text), node, text))
         node = node.parent
 
