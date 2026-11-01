@@ -14,7 +14,7 @@ OUTPUT_COLUMNS = BASE_COLUMNS + ["Source"]
 
 
 def clean(value):
-    return re.sub(r"\\s+", " ", str(value or "")).strip()
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def read_source(path, source_name):
