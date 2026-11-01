@@ -336,8 +336,16 @@ def extract_listing_event(anchor):
     name = clean_text(name)
     name = re.sub(r"^(?:Featured\s+)+", "", name, flags=re.I).strip()
     if not name:
-        # Some cards put the event name after the date; fall back to the
-        # anchor's visible text before the host label.
+        # Some compact cards place the event title after the date.
+        after_date = card_text[date_match.end():]
+        name = re.split(
+            r"\s+Hosted by\s+|\s+\d{1,2}:\d{2}",
+            after_date,
+            maxsplit=1,
+            flags=re.I,
+        )[0]
+        name = clean_text(name)
+    if not name:
         anchor_text = clean_text(anchor.get_text(" ", strip=True))
         name = re.split(r"\s+Hosted by\s+", anchor_text, maxsplit=1, flags=re.I)[0]
     if not name:
@@ -466,13 +474,14 @@ def fetch_all_listing_events(page):
             event_url = urljoin(BASE_URL, href.split("#", 1)[0])
             if event_url in visited_urls:
                 continue
-            visited_urls.add(event_url)
 
             try:
                 event = extract_listing_event(anchor)
+                visited_urls.add(event_url)
                 all_events.append(event)
                 page_events += 1
             except Exception as exc:
+                # Leave failed links eligible for a richer city-page card.
                 failures.append(f"{source_url} | {event_url} | {exc}")
 
         print(
@@ -481,11 +490,18 @@ def fetch_all_listing_events(page):
         )
         time.sleep(PAGE_DELAY)
 
+    if failures:
+        detail = "\n".join(failures[:20])
+        raise RuntimeError(
+            f"{len(failures)} Texas event cards could not be parsed. "
+            "The previous snapshot was preserved rather than publishing "
+            "an incomplete report. First errors:\n" + detail
+        )
+
     if not all_events:
-        detail = "; ".join(failures[:8])
         raise RuntimeError(
             "No Texas event records could be extracted from the statewide "
-            "or city listings. " + detail
+            "or city listings."
         )
 
     return all_events, failures, expected_count, pages_read
