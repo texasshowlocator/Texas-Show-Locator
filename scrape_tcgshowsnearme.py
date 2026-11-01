@@ -202,6 +202,136 @@ def fetch_all_listing_links(page):
     return links, expected_count, 1
 
 # ============================================================
+# DIRECT EXTRACTION FROM THE STATEWIDE LISTING
+# ============================================================
+
+def is_event_detail_url(href):
+    path = urlparse(href).path.strip("/")
+    if not path.startswith("events/"):
+        return False
+    excluded = (
+        "events/pillar/", "events/d/", "events/in/",
+        "events/organizer", "events/category", "events/seasonal/",
+    )
+    return not any(path.startswith(item) for item in excluded)
+
+
+def extract_listing_event(anchor):
+    """
+    Extract one event occurrence from its listing card. Detail pages are
+    intentionally not requested because the host returns HTTP 403 to them.
+    """
+    month = (
+        r"(?:January|February|March|April|May|June|July|August|"
+        r"September|October|November|December)"
+    )
+    date_re = re.compile(
+        rf"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\\s+{month}\\s+"
+        r"\\d{1,2},?\\s+\\d{4}",
+        re.IGNORECASE,
+    )
+
+    candidates = []
+    node = anchor
+    for _ in range(7):
+        if node is None:
+            break
+        text = clean_text(node.get_text(" ", strip=True))
+        if date_re.search(text) and re.search(r"\\b(?:TX|Texas)\\b", text, re.I):
+            if len(text) <= 1800:
+                candidates.append((len(text), node, text))
+        node = node.parent
+
+    if not candidates:
+        raise ValueError("Could not find a complete Texas event card in the listing")
+
+    _, card, card_text = min(candidates, key=lambda item: item[0])
+    lines = [
+        clean_text(line)
+        for line in card.get_text("\\n", strip=True).splitlines()
+        if clean_text(line)
+    ]
+
+    date_match = date_re.search(card_text)
+    start = parse_date(date_match.group(0)) if date_match else None
+    if not start:
+        raise ValueError("Could not parse event date from listing card")
+
+    # Use the event heading when available. Otherwise use the first line of
+    # the card, which is the title in the site's listing layout.
+    heading = card.find(["h2", "h3", "h4"])
+    name = clean_text(heading.get_text(" ", strip=True)) if heading else ""
+    if not name:
+        name = clean_text(anchor.get_text(" ", strip=True))
+    if date_re.search(name):
+        name = ""
+    if not name:
+        name = lines[0] if lines else ""
+    if not name:
+        raise ValueError("Could not determine event name from listing card")
+
+    # Prefer the complete street-address line, then include the city/state
+    # line. If only a city/state line is available, retain it as the location.
+    state_index = next(
+        (i for i, line in enumerate(lines)
+         if re.search(r"\\b(?:TX|Texas)\\b", line, re.I)),
+        None,
+    )
+    if state_index is None:
+        raise ValueError(f"Could not verify Texas location for {name}")
+
+    location_lines = []
+    for line in lines[max(0, state_index - 2):state_index + 1]:
+        if line.casefold() in {"united states", "usa"}:
+            continue
+        if date_re.search(line) or re.match(r"^\\d{1,2}:\\d{2}", line):
+            continue
+        if line not in location_lines:
+            location_lines.append(line)
+    location = ", ".join(location_lines)
+
+    # Remove obvious non-event links and malformed title-only cards.
+    if not location:
+        raise ValueError(f"Could not extract venue/address for {name}")
+
+    return {
+        "Start": start,
+        "End": start,
+        "Event": name,
+        "Venue/Address": location,
+    }
+
+
+def extract_events_from_listing(page):
+    soup = BeautifulSoup(page.content(), "html.parser")
+    events = []
+    failures = []
+    seen = set()
+
+    for anchor in soup.find_all("a", href=True):
+        href = clean_text(anchor.get("href"))
+        if not is_event_detail_url(href):
+            continue
+        try:
+            event = extract_listing_event(anchor)
+            key = event_key(event)
+            if key not in seen:
+                seen.add(key)
+                events.append(event)
+        except Exception as exc:
+            failures.append(f"{href} | {exc}")
+
+    if not events:
+        detail = "; ".join(failures[:5])
+        raise RuntimeError(
+            "No complete event records could be extracted from the Texas listing. "
+            + detail
+        )
+
+    return events, failures
+
+
+# ============================================================
 # JSON-LD AND DETAIL PAGE EXTRACTION
 # ============================================================
 
@@ -591,42 +721,29 @@ def main():
             page = context.new_page()
 
             try:
-                listings, expected_count, pages_read = fetch_all_listing_links(page)
-                print(f"Unique event links collected: {len(listings)}")
-
-                events = []
-
-                for index, listing in enumerate(listings, start=1):
-                    label = listing["name"] or listing["url"]
-                    print(
-                        f"Detail {index}/{len(listings)}: {label}"
+                response = page.goto(
+                    LISTING_URL,
+                    wait_until="domcontentloaded",
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if response and response.status >= 400:
+                    raise RuntimeError(
+                        f"Texas statewide listing returned HTTP {response.status}"
                     )
-                    try:
-                        events.append(fetch_event_detail(page, listing))
-                    except Exception as exc:
-                        failures.append(f"{label} | {listing['url']} | {exc}")
-                        print(f"  FAILED: {exc}")
-                        # Stop after three failures so a blocked detail route
-                        # does not waste time requesting every remaining event.
-                        if len(failures) >= 3:
-                            print("Stopping after three detail-page failures.")
-                            break
-                    time.sleep(DETAIL_DELAY)
+                page.locator("body").wait_for(timeout=20000)
+                soup = BeautifulSoup(page.content(), "html.parser")
+                expected_count = extract_expected_count(soup)
+                pages_read = 1
+                events, failures = extract_events_from_listing(page)
+                listings = [{"url": "", "name": row["Event"]} for row in events]
+                print(f"Extracted {len(events)} event records directly from the listing.")
+                if failures:
+                    print(f"Listing cards skipped because fields were incomplete: {len(failures)}")
             finally:
                 browser.close()
 
-        if failures:
-            raise RuntimeError(
-                f"{len(failures)} event detail page(s) failed "
-                f"(stopped early; {len(listings)} links were collected). "
-                "The master report and previous snapshot were preserved."
-            )
-
-        if len(events) != len(listings):
-            raise RuntimeError(
-                f"Event count mismatch: {len(events)} detail records for "
-                f"{len(listings)} listing links."
-            )
+        if len(events) < 1:
+            raise RuntimeError("No Texas event records were extracted from the listing.")
 
         # Remove duplicate event rows before merging date ranges.
         unique = {}
