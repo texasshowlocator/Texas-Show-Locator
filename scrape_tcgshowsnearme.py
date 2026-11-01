@@ -242,91 +242,74 @@ def debug_card_structure(anchor):
 
 def extract_listing_event(anchor):
     """
-    Extract one event occurrence from its listing card. Detail pages are
-    intentionally not requested because the host returns HTTP 403 to them.
+    Parse the complete event record from the event link itself.
+    The Texas listing renders the title, host, date, time, venue and address
+    inside one <a class="block"> element rather than a separate card wrapper.
     """
+    text = clean_text(anchor.get_text(" ", strip=True))
+
     month = (
-        r"(?:January|February|March|April|May|June|July|August|"
-        r"September|October|November|December)"
+        r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
+        r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|"
+        r"Nov(?:ember)?|Dec(?:ember)?)"
     )
     date_re = re.compile(
         rf"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+{month}\s+"
         r"\d{1,2},?\s+\d{4}",
         re.IGNORECASE,
     )
+    date_match = date_re.search(text)
+    if not date_match:
+        raise ValueError("Could not parse abbreviated event date from event link")
 
-    candidates = []
-    node = anchor
-    for _ in range(20):
-        if node is None:
-            break
-        text = clean_text(node.get_text(" ", strip=True))
-        if date_re.search(text) and re.search(r"\b(?:TX|Texas)\b", text, re.I):
-            if len(text) <= 4000:
-                candidates.append((len(text), node, text))
-        node = node.parent
-
-    if not candidates:
-        diagnostic = debug_card_structure(anchor)
-        raise ValueError(
-            "Could not find a complete Texas event card in the listing. DOM DIAGNOSTIC: "
-            + diagnostic
-        )
-
-    _, card, card_text = min(candidates, key=lambda item: item[0])
-    lines = [
-        clean_text(line)
-        for line in card.get_text("\n", strip=True).splitlines()
-        if clean_text(line)
-    ]
-
-    date_match = date_re.search(card_text)
-    start = parse_date(date_match.group(0)) if date_match else None
+    start = parse_date(date_match.group(0))
     if not start:
-        raise ValueError("Could not parse event date from listing card")
+        raise ValueError("Could not convert event date from event link")
 
-    # Use the event heading when available. Otherwise use the first line of
-    # the card, which is the title in the site's listing layout.
-    heading = card.find(["h2", "h3", "h4"])
-    name = clean_text(heading.get_text(" ", strip=True)) if heading else ""
+    # The event name precedes the "Hosted by" label in the listing text.
+    before_date = text[:date_match.start()].strip()
+    name = re.split(r"\s+Hosted by\s+", before_date, maxsplit=1, flags=re.I)[0]
+    name = clean_text(name)
     if not name:
-        name = clean_text(anchor.get_text(" ", strip=True))
-    if date_re.search(name):
-        name = ""
-    if not name:
-        name = lines[0] if lines else ""
-    if not name:
-        raise ValueError("Could not determine event name from listing card")
+        raise ValueError("Could not determine event name from event link")
 
-    # Prefer the complete street-address line, then include the city/state
-    # line. If only a city/state line is available, retain it as the location.
-    state_index = next(
-        (i for i, line in enumerate(lines)
-         if re.search(r"\b(?:TX|Texas)\b", line, re.I)),
-        None,
+    # The time range follows the date. Location starts immediately afterward.
+    time_match = re.search(
+        r"\d{1,2}:\d{2}\s*(?:AM|PM)?\s*[-–]\s*"
+        r"\d{1,2}:\d{2}\s*(?:AM|PM)?",
+        text[date_match.end():],
+        re.IGNORECASE,
     )
-    if state_index is None:
+    if not time_match:
+        raise ValueError(f"Could not locate event time and address for {name}")
+
+    location_start = date_match.end() + time_match.end()
+    location_text = text[location_start:].strip()
+
+    # Listing cards append promotional tags after the address. Remove those
+    # tags while preserving the venue, street address and city/state.
+    feature_re = re.compile(
+        r"\s+(?:Trade Night|"
+        r"\d+\+?\s+Vendors?|"
+        r"Free Entry|Free Parking|Free for Kids|"
+        r"Prize Draw|Giveaway|Tournament|Tournaments|"
+        r"Early Bird|Door Prizes|Admission|"
+        r"\$\s*\d+(?:\.\d{2})?).*$",
+        re.IGNORECASE,
+    )
+    location_text = feature_re.sub("", location_text).strip(" ,")
+
+    if not re.search(r"\b(?:TX|Texas)\b", location_text, re.IGNORECASE):
         raise ValueError(f"Could not verify Texas location for {name}")
 
-    location_lines = []
-    for line in lines[max(0, state_index - 2):state_index + 1]:
-        if line.casefold() in {"united states", "usa"}:
-            continue
-        if date_re.search(line) or re.match(r"^\d{1,2}:\d{2}", line):
-            continue
-        if line not in location_lines:
-            location_lines.append(line)
-    location = ", ".join(location_lines)
-
-    # Remove obvious non-event links and malformed title-only cards.
-    if not location:
+    if not location_text:
         raise ValueError(f"Could not extract venue/address for {name}")
 
     return {
         "Start": start,
         "End": start,
         "Event": name,
-        "Venue/Address": location,
+        "Venue/Address": location_text,
     }
 
 
