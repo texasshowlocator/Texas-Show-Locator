@@ -142,33 +142,42 @@ def discover_listings(session):
 
 
 def extract_address(lines):
-    """Extract the event venue from the Description section, not seller metadata."""
+    """Return only event-location information found in the event description."""
     lines = [clean(line) for line in lines if clean(line)]
     description_index = next(
         (i for i, line in enumerate(lines) if line.casefold() == "description"),
         None,
     )
-    description = lines[description_index + 1:] if description_index is not None else lines
+    if description_index is None:
+        return ""
+
+    description = lines[description_index + 1:]
     stop = next(
         (i for i, line in enumerate(description)
          if re.match(r"^(questions\s*&\s*answers|post a question|similar listings)\b", line, re.I)),
         len(description),
     )
     description = description[:stop]
-    texas_hits = [
-        i for i, line in enumerate(description)
-        if re.search(r"\b(?:TX|Texas)\b", line, re.I)
-        and not re.search(r"\b(?:seller|contact|email)\b", line, re.I)
+    text = " ".join(description)
+
+    # Prefer a venue/address phrase in the event description.
+    patterns = [
+        r"(?:conveniently located|located|held|taking place)\s+at\s+(.+?\b(?:TX|Texas)\b(?:\s+\d{5}(?:-\d{4})?)?)",
+        r"\bat\s+((?:The\s+)?[A-Z][^.;]{5,140}?\b(?:TX|Texas)\b(?:\s+\d{5}(?:-\d{4})?)?)",
+        r"((?:[A-Z][A-Za-z0-9.'& -]{2,70}),\s*\d{1,6}\s+[A-Za-z0-9 .'-]+,\s*[A-Z][A-Za-z .'-]+,\s*TX(?:\s+\d{5})?)",
     ]
-    if texas_hits:
-        hit = texas_hits[-1]
-        block = description[max(0, hit - 4):hit + 1]
-        while block and re.search(
-            r"\b(show hours|admission|dealer setup|december \d|january \d|friday|saturday)\b",
-            block[0], re.I
-        ):
-            block.pop(0)
-        return ", ".join(block[-5:])
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            result = clean(match.group(1)).strip(" ,.;")
+            if not re.search(r"\b(?:seller|contact|email|watchlist|zip search|browse)\b", result, re.I):
+                return result
+
+    # Some listings give a venue and street address but omit the state.
+    for index, line in enumerate(description):
+        if re.search(r"\b\d{1,6}\s+[A-Za-z0-9 .'-]+(?:Road|Rd|Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Lane|Ln|Highway|Hwy)\b", line, re.I):
+            return clean(" ".join(description[max(0, index - 1):index + 2]))
+
     return ""
 
 
@@ -176,6 +185,7 @@ def scrape_event(session, listing):
     response = session.get(listing["url"], timeout=45)
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
+
     title_node = soup.find("h1")
     if title_node:
         title_copy = BeautifulSoup(str(title_node), "html.parser")
@@ -183,7 +193,15 @@ def scrape_event(session, listing):
             node.decompose()
         title = clean(title_copy.get_text(" ", strip=True))
     else:
-        title = clean(listing["title"])
+        title = clean(listing.get("title", ""))
+
+    # Some CoinZip pages accidentally expose description text in the heading.
+    for marker in (
+        " Over 125 dealers", " Sponsored by", " The show is", " This show ",
+        " FREE admission", " Public Hours:", " Dealer set up"
+    ):
+        if marker.casefold() in title.casefold():
+            title = re.split(re.escape(marker), title, maxsplit=1, flags=re.I)[0].strip()
 
     lines = [clean(line) for line in soup.get_text("\n").splitlines() if clean(line)]
     description_index = next(
@@ -193,42 +211,46 @@ def scrape_event(session, listing):
     description_lines = lines[description_index + 1:] if description_index is not None else []
     description_stop = next(
         (i for i, line in enumerate(description_lines)
-         if re.match(r"^(questions\s*&\s*answers|post a question)\b", line, re.I)),
+         if re.match(r"^(questions\s*&\s*answers|post a question|similar listings)\b", line, re.I)),
         len(description_lines),
     )
     description_lines = description_lines[:description_stop]
-    address = extract_address(lines)
-    if re.search(r",\s*(?:AZ|CA|CO|FL|IL|NY|OK|TN|UT|VA|WA)\b", address, re.I):
-        address = ""
+    description_text = " ".join(description_lines)
 
-    date_parts = [listing.get("title", ""), listing.get("listing_text", ""), title]
-    if title_node:
-        subtitle = title_node.find_next(["h2", "h3"])
-        if subtitle:
-            date_parts.append(clean(subtitle.get_text(" ", strip=True)))
-    date_parts.extend(description_lines[:30])
-    dates = parse_dates(" ".join(date_parts))
+    address = extract_address(lines)
+
+    # Prefer public event dates in the description over setup dates in the title.
+    public_date_text = description_text
+    setup_match = re.search(
+        r"\b(?:dealer\s+set[\s-]?up|dealer\s+setup|early\s+bird)\b",
+        public_date_text, re.I
+    )
+    if setup_match:
+        public_date_text = public_date_text[:setup_match.start()]
+
+    dates = parse_dates(public_date_text) if public_date_text else None
+    if dates is None:
+        date_parts = [
+            clean(listing.get("title", "")),
+            title,
+            clean(listing.get("listing_text", "")),
+        ]
+        dates = parse_dates(" ".join(date_parts))
     if dates is None:
         raise ValueError(f"Could not parse event dates for {title!r}")
+
     start, end = dates
     if end < date.today():
         return None
 
-    if not address:
-        for line in description_lines:
-            if re.search(r"\b[A-Z][A-Za-z .'-]+,\s*TX(?:\s+\d{5})?\b", line):
-                address = clean(line)
-                break
-            if re.search(r"\b[A-Z][A-Za-z .'-]+,\s*Texas\b", line, re.I):
-                address = clean(line)
-                break
-
-    if address and not re.search(r"\bTX\b|Texas", address, re.I):
-        address = ""
     if not title or title.casefold() in {"view", "image"}:
-        raise ValueError("Event title was empty after removing page controls.")
-    if re.search(r"add to watch list|view watchlist|watching", title, re.I):
-        raise ValueError(f"Event title contains CoinZip navigation text: {title!r}")
+        raise ValueError("Event title was empty after cleaning.")
+    if re.search(r"add to watch list|view watchlist|watching|zip search|browse", title, re.I):
+        raise ValueError(f"Event title contains CoinZip page text: {title!r}")
+
+    # Never use seller/profile information as the event venue.
+    if re.search(r"\b(?:seller|contact|watchlist|zip search|browse)\b", address, re.I):
+        address = ""
 
     return {
         "Start": start.strftime("%m/%d/%y"),
