@@ -286,8 +286,70 @@ def read_snapshot():
         return [{key: row.get(key, "") for key in COLUMNS} for row in reader], True
 
 
-def key(row):
-    return tuple(clean(row[c]).casefold() for c in ("Start", "Event", "Venue/Address"))
+def event_name_key(row):
+    return re.sub(r"[^a-z0-9]+", "", clean(row.get("Event", "")).casefold())
+
+
+def date_range(row):
+    return (datetime.strptime(row["Start"], "%m/%d/%y").date(),
+            datetime.strptime(row["End"], "%m/%d/%y").date())
+
+
+def date_gap_days(left, right):
+    left_start, left_end = date_range(left)
+    right_start, right_end = date_range(right)
+    if left_start <= right_end and right_start <= left_end:
+        return 0
+    if left_end < right_start:
+        return (right_start - left_end).days
+    return (left_start - right_end).days
+
+
+def reconcile_events(previous, current, date_tolerance_days=45):
+    """Match by normalized title and nearest date; venue is secondary."""
+    unmatched_old = set(range(len(previous)))
+    reconciled, changes = [], []
+
+    for new_row in sorted(current, key=lambda row: (row["Start"], row["Event"].casefold())):
+        candidates = [
+            (date_gap_days(previous[i], new_row), i)
+            for i in unmatched_old
+            if event_name_key(previous[i]) == event_name_key(new_row)
+        ]
+        candidates = [item for item in candidates if item[0] <= date_tolerance_days]
+        if not candidates:
+            row = new_row.copy()
+            reconciled.append(row)
+            change = row.copy()
+            change["Change"] = "NEW"
+            changes.append(change)
+            continue
+
+        _, old_index = min(candidates, key=lambda item: (item[0], previous[item[1]]["Start"]))
+        unmatched_old.remove(old_index)
+        old_row = previous[old_index]
+        row = new_row.copy()
+
+        # Do not erase a previously confirmed venue when this scrape returns blank.
+        if not clean(row.get("Venue/Address")) and clean(old_row.get("Venue/Address")):
+            row["Venue/Address"] = old_row["Venue/Address"]
+
+        reconciled.append(row)
+        changed = any(clean(old_row.get(field)) != clean(row.get(field))
+                      for field in ("Start", "End", "Venue/Address"))
+        if changed:
+            change = row.copy()
+            change["Change"] = "UPDATED"
+            changes.append(change)
+
+    for index in unmatched_old:
+        row = previous[index].copy()
+        row["Change"] = "REMOVED"
+        changes.append(row)
+
+    reconciled.sort(key=lambda row: (datetime.strptime(row["Start"], "%m/%d/%y"), row["Event"].casefold()))
+    changes.sort(key=lambda row: (datetime.strptime(row["Start"], "%m/%d/%y"), row["Event"].casefold(), row["Change"]))
+    return reconciled, changes
 
 
 def main():
@@ -316,19 +378,9 @@ def main():
         if not events:
             raise RuntimeError("No upcoming Texas events were collected.")
         previous, has_snapshot = read_snapshot()
-        old = {key(row): row for row in previous}
-        new = {key(row): row for row in events}
         changes = []
         if has_snapshot:
-            for k in new.keys() - old.keys():
-                row = new[k].copy()
-                row["Change"] = "NEW"
-                changes.append(row)
-            for k in old.keys() - new.keys():
-                row = old[k].copy()
-                row["Change"] = "REMOVED"
-                changes.append(row)
-        changes.sort(key=lambda row: (row["Start"], row["Event"].casefold(), row["Change"]))
+            events, changes = reconcile_events(previous, events)
         write_csv(MAIN_CSV, events, COLUMNS)
         write_csv(CHANGES_CSV, changes, CHANGE_COLUMNS)
         temp = SNAPSHOT_FILE.with_suffix(".tmp")
@@ -344,6 +396,7 @@ def main():
         file.write(f"Run time: {started}\nSource: {LISTING_URL}\nStatus: {status}\n")
         file.write(f"Event links found: {found}\nEvents collected: {len(events)}\n")
         file.write(f"New events: {sum(row['Change'] == 'NEW' for row in changes)}\n")
+        file.write(f"Updated events: {sum(row['Change'] == 'UPDATED' for row in changes)}\n")
         file.write(f"Removed events: {sum(row['Change'] == 'REMOVED' for row in changes)}\n")
         if baseline:
             file.write("A new snapshot baseline was created; no changes were reported.\n")
