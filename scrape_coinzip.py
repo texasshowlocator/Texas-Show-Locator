@@ -177,6 +177,14 @@ def extract_address(lines):
     for index, line in enumerate(description):
         if re.search(r"\b\d{1,6}\s+[A-Za-z0-9 .'-]+(?:Road|Rd|Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Lane|Ln|Highway|Hwy)\b", line, re.I):
             return clean(" ".join(description[max(0, index - 1):index + 2]))
+        if re.search(r"^\d{1,6}\s+[A-Za-z0-9 .'-]+,\s*[A-Z][A-Za-z .'-]+$", line):
+            venue = description[index - 1] if index > 0 else ""
+            city = ""
+            for candidate in description[index + 1:index + 3]:
+                if re.search(r"\b(?:TX|Texas)\b", candidate, re.I):
+                    city = candidate
+                    break
+            return clean(", ".join(part for part in (venue, line, city) if part))
 
     return ""
 
