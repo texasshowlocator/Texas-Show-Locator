@@ -30,7 +30,8 @@ HEADERS = {
 MONTHS = {name.lower(): number for number, name in enumerate(
     ["January", "February", "March", "April", "May", "June",
      "July", "August", "September", "October", "November", "December"], 1)}
-MONTH_PATTERN = "|".join(MONTHS)
+MONTHS.update({"jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12})
+MONTH_PATTERN = "|".join(sorted(MONTHS, key=len, reverse=True))
 DATE_RE = re.compile(
     rf"(?:(?P<month>{MONTH_PATTERN})\.?\s+)?"
     rf"(?P<day>\d{{1,2}})(?:st|nd|rd|th)?"
