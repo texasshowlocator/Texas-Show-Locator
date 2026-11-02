@@ -162,13 +162,13 @@ def extract_address(lines):
     ]
     if texas_hits:
         hit = texas_hits[-1]
-        block = description[max(0, hit - 3):hit + 1]
+        block = description[max(0, hit - 4):hit + 1]
         while block and re.search(
             r"\b(show hours|admission|dealer setup|december \d|january \d|friday|saturday)\b",
             block[0], re.I
         ):
             block.pop(0)
-        return ", ".join(block[-4:])
+        return ", ".join(block[-5:])
     return ""
 
 
