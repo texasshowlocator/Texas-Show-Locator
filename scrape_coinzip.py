@@ -139,23 +139,33 @@ def discover_listings(session):
 
 
 def extract_address(lines):
+    """Extract the event venue from the Description section, not seller metadata."""
     lines = [clean(line) for line in lines if clean(line)]
-    # Prefer the block after a Location label; stop at common next sections.
-    for index, line in enumerate(lines):
-        if re.match(r"^location\s*:?$", line, re.I):
-            block = []
-            for candidate in lines[index + 1:index + 8]:
-                if re.match(r"^(hours|admission|zip code|questions|description)\b", candidate, re.I):
-                    break
-                block.append(candidate)
-                if re.search(r"\bTX\s+\d{5}(?:-\d{4})?\b", candidate, re.I):
-                    break
-            text = ", ".join(block)
-            if text:
-                return text
-    for index, line in enumerate(lines):
-        if re.search(r"\b(?:TX|Texas)\b", line, re.I):
-            return ", ".join(lines[max(0, index - 2):index + 1])
+    description_index = next(
+        (i for i, line in enumerate(lines) if line.casefold() == "description"),
+        None,
+    )
+    description = lines[description_index + 1:] if description_index is not None else lines
+    stop = next(
+        (i for i, line in enumerate(description)
+         if re.match(r"^(questions\\s*&\\s*answers|post a question|similar listings)\\b", line, re.I)),
+        len(description),
+    )
+    description = description[:stop]
+    texas_hits = [
+        i for i, line in enumerate(description)
+        if re.search(r"\\b(?:TX|Texas)\\b", line, re.I)
+        and not re.search(r"\\b(?:seller|contact|email)\\b", line, re.I)
+    ]
+    if texas_hits:
+        hit = texas_hits[-1]
+        block = description[max(0, hit - 3):hit + 1]
+        while block and re.search(
+            r"\\b(show hours|admission|dealer setup|december \\d|january \\d|friday|saturday)\\b",
+            block[0], re.I
+        ):
+            block.pop(0)
+        return ", ".join(block[-4:])
     return ""
 
 
@@ -163,42 +173,59 @@ def scrape_event(session, listing):
     response = session.get(listing["url"], timeout=45)
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
-    lines = [clean(line) for line in soup.get_text("\n").splitlines() if clean(line)]
     title_node = soup.find("h1")
-    title = clean(title_node.get_text(" ", strip=True)) if title_node else listing["title"]
-    if not title:
-        title = listing["title"]
-
-    # The category is already Texas-specific; still validate the detail page's
-    # location when a state abbreviation is exposed.
-    state_evidence = " ".join(lines)
-    address = extract_address(lines)
-    if re.search(r",\s*(?:AZ|CA|CO|FL|IL|NY|OK|TN|UT|VA|WA)\b", address, re.I):
-        return None
-
-    date_text = " ".join([listing["title"], listing["listing_text"], title])
-    # Detail pages often put the event date in the title/subtitle, before the description.
     if title_node:
-        subtitle = title_node.find_next(["h2", "h3", "p"])
+        title_copy = BeautifulSoup(str(title_node), "html.parser")
+        for node in title_copy.select("a, button, svg, img"):
+            node.decompose()
+        title = clean(title_copy.get_text(" ", strip=True))
+    else:
+        title = clean(listing["title"])
+
+    lines = [clean(line) for line in soup.get_text("\\n").splitlines() if clean(line)]
+    description_index = next(
+        (i for i, line in enumerate(lines) if line.casefold() == "description"),
+        None,
+    )
+    description_lines = lines[description_index + 1:] if description_index is not None else []
+    description_stop = next(
+        (i for i, line in enumerate(description_lines)
+         if re.match(r"^(questions\\s*&\\s*answers|post a question)\\b", line, re.I)),
+        len(description_lines),
+    )
+    description_lines = description_lines[:description_stop]
+    address = extract_address(lines)
+    if re.search(r",\\s*(?:AZ|CA|CO|FL|IL|NY|OK|TN|UT|VA|WA)\\b", address, re.I):
+        address = ""
+
+    date_parts = [listing.get("title", ""), listing.get("listing_text", ""), title]
+    if title_node:
+        subtitle = title_node.find_next(["h2", "h3"])
         if subtitle:
-            date_text += " " + clean(subtitle.get_text(" ", strip=True))
-    dates = parse_dates(date_text)
-    if dates is None:
-        # Check the descriptive text for common full-date formats.
-        dates = parse_dates(" ".join(lines[:30]))
+            date_parts.append(clean(subtitle.get_text(" ", strip=True)))
+    date_parts.extend(description_lines[:30])
+    dates = parse_dates(" ".join(date_parts))
     if dates is None:
         raise ValueError(f"Could not parse event dates for {title!r}")
-
     start, end = dates
     if end < date.today():
         return None
-    # The browse page is Texas-filtered. Require explicit Texas address evidence
-    # when the listing detail provides a location block.
-    if address and not re.search(r"\bTX\b|Texas", address, re.I):
-        # CoinZip sometimes omits the state beside the address; listing location
-        # metadata may still state the event's Texas city.
-        if not re.search(r",\s*TX\b|\bTexas\b", state_evidence, re.I):
-            address = ""
+
+    if not address:
+        for line in description_lines:
+            if re.search(r"\\b[A-Z][A-Za-z .'-]+,\\s*TX(?:\\s+\\d{5})?\\b", line):
+                address = clean(line)
+                break
+            if re.search(r"\\b[A-Z][A-Za-z .'-]+,\\s*Texas\\b", line, re.I):
+                address = clean(line)
+                break
+
+    if address and not re.search(r"\\bTX\\b|Texas", address, re.I):
+        address = ""
+    if not title or title.casefold() in {"view", "image"}:
+        raise ValueError("Event title was empty after removing page controls.")
+    if re.search(r"add to watch list|view watchlist|watching", title, re.I):
+        raise ValueError(f"Event title contains CoinZip navigation text: {title!r}")
 
     return {
         "Start": start.strftime("%m/%d/%y"),
