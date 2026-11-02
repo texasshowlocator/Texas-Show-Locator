@@ -1,0 +1,62 @@
+name: CoinZip Texas Events Scraper
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: texas-show-locator-repo-writes
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install scraper dependencies
+        run: python -m pip install requests beautifulsoup4
+
+      - name: Run CoinZip scraper
+        run: python scrape_coinzip.py
+
+      - name: Commit updated CoinZip snapshot
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/coinzip_previous_snapshot.csv
+          git diff --cached --quiet || git commit -m "Update CoinZip event snapshot"
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git rebase origin/main
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "Push attempt $attempt failed; retrying after fetching latest main."
+          done
+          echo "Unable to push snapshot updates after 3 attempts."
+          exit 1
+
+      - name: Upload CoinZip reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coinzip-texas-event-reports
+          path: |
+            output/coinzip_events.csv
+            output/coinzip_daily_changes.csv
+            output/coinzip_scrape_audit.txt
+          if-no-files-found: warn
+          retention-days: 30
