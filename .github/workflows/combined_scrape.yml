@@ -60,6 +60,9 @@ jobs:
       - name: Run OnTreasure scraper
         run: python scrape_ontreasure.py
 
+      - name: Run CoinZip scraper
+        run: python scrape_coinzip.py
+
       - name: Build combined CSV report
         run: python combine_scraper_reports.py
 
@@ -67,8 +70,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/previous_snapshot.csv data/ontreasure_previous_snapshot.csv
-          git diff --cached --quiet || git commit -m "Update TCDB and OnTreasure event snapshots"
+          git add data/previous_snapshot.csv data/ontreasure_previous_snapshot.csv data/coinzip_previous_snapshot.csv
+          git diff --cached --quiet || git commit -m "Update TCDB, OnTreasure, and CoinZip event snapshots"
           for attempt in 1 2 3; do
             git fetch origin main
             git rebase origin/main
@@ -89,9 +92,12 @@ jobs:
             output/combined_texas_card_shows.csv
             output/texas_card_shows.csv
             output/ontreasure_events.csv
+            output/coinzip_events.csv
             output/daily_changes.csv
             output/ontreasure_daily_changes.csv
+            output/coinzip_daily_changes.csv
             output/scrape_audit.txt
             output/ontreasure_scrape_audit.txt
+            output/coinzip_scrape_audit.txt
           if-no-files-found: warn
           retention-days: 30
