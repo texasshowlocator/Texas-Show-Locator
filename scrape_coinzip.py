@@ -1,4 +1,5 @@
 import csv
+import json
 import re
 import sys
 import time
@@ -18,6 +19,7 @@ LISTING_URL = f"{BASE_URL}/Browse/C160534-C161363/US-Coin-Shows-Texas"
 DATA_DIR = Path("data")
 OUTPUT_DIR = Path("output")
 SNAPSHOT_FILE = DATA_DIR / "coinzip_previous_snapshot.csv"
+MISSING_FILE = DATA_DIR / "coinzip_missing_candidates.json"
 MAIN_CSV = OUTPUT_DIR / "coinzip_events.csv"
 CHANGES_CSV = OUTPUT_DIR / "coinzip_daily_changes.csv"
 AUDIT_FILE = OUTPUT_DIR / "coinzip_scrape_audit.txt"
@@ -305,10 +307,31 @@ def date_gap_days(left, right):
     return (left_start - right_end).days
 
 
-def reconcile_events(previous, current, date_tolerance_days=45):
-    """Match by normalized title and nearest date; venue is secondary."""
+def read_missing_candidates():
+    if not MISSING_FILE.exists():
+        return set()
+    try:
+        with MISSING_FILE.open(encoding="utf-8") as file:
+            value = json.load(file)
+        return set(value if isinstance(value, list) else [])
+    except (OSError, ValueError):
+        return set()
+
+
+def write_missing_candidates(keys):
+    temp = MISSING_FILE.with_suffix(".tmp")
+    with temp.open("w", encoding="utf-8") as file:
+        json.dump(sorted(keys), file, indent=2)
+    temp.replace(MISSING_FILE)
+
+
+def reconcile_events(previous, current, previously_missing=None, date_tolerance_days=45):
+    """Match by normalized title and nearest date; venue is secondary.
+    A missing listing is confirmed as REMOVED only after two successful scrapes.
+    """
+    previously_missing = previously_missing or set()
     unmatched_old = set(range(len(previous)))
-    reconciled, changes = [], []
+    reconciled, changes, missing_now = [], [], set()
 
     for new_row in sorted(current, key=lambda row: (row["Start"], row["Event"].casefold())):
         candidates = [
@@ -344,12 +367,19 @@ def reconcile_events(previous, current, date_tolerance_days=45):
 
     for index in unmatched_old:
         row = previous[index].copy()
-        row["Change"] = "REMOVED"
-        changes.append(row)
+        missing_key = f"{event_name_key(row)}|{row['Start']}"
+        if missing_key in previously_missing:
+            row["Change"] = "REMOVED"
+            changes.append(row)
+        else:
+            # Keep it in the snapshot for one successful run to avoid false removals
+            # caused by a temporarily incomplete CoinZip listing page.
+            reconciled.append(row)
+            missing_now.add(missing_key)
 
     reconciled.sort(key=lambda row: (datetime.strptime(row["Start"], "%m/%d/%y"), row["Event"].casefold()))
     changes.sort(key=lambda row: (datetime.strptime(row["Start"], "%m/%d/%y"), row["Event"].casefold(), row["Change"]))
-    return reconciled, changes
+    return reconciled, changes, missing_now
 
 
 def main():
@@ -379,13 +409,17 @@ def main():
             raise RuntimeError("No upcoming Texas events were collected.")
         previous, has_snapshot = read_snapshot()
         changes = []
+        missing_candidates = set()
         if has_snapshot:
-            events, changes = reconcile_events(previous, events)
+            events, changes, missing_candidates = reconcile_events(
+                previous, events, read_missing_candidates()
+            )
         write_csv(MAIN_CSV, events, COLUMNS)
         write_csv(CHANGES_CSV, changes, CHANGE_COLUMNS)
         temp = SNAPSHOT_FILE.with_suffix(".tmp")
         write_csv(temp, events, COLUMNS)
         temp.replace(SNAPSHOT_FILE)
+        write_missing_candidates(missing_candidates)
         baseline = not has_snapshot
     except Exception as exc:
         status, error, baseline = "FAILED - SNAPSHOT PRESERVED", str(exc), False
