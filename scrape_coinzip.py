@@ -191,6 +191,34 @@ def extract_address(lines):
     return ""
 
 
+def verified_venue_override(title):
+    """Previously verified CoinZip event venues; never infer locations for other shows."""
+    normalized = re.sub(r"[^a-z0-9]+", " ", clean(title).casefold()).strip()
+
+    known = [
+        (
+            ("grapevine" in normalized and "coin" in normalized),
+            "Convention Center, 1209 S. Main Street, Grapevine, TX 76051",
+        ),
+        (
+            ("austin airport" in normalized and "coin" in normalized),
+            "Hilton Garden Inn, 7610 John Glenn Way, Austin, TX",
+        ),
+        (
+            ("christmas" in normalized and "coin show" in normalized and "houston" in normalized),
+            "West Oaks Fellowship Event Center, 14440 Richmond Ave., Houston, TX 77082",
+        ),
+        (
+            ("70th houston money show" in normalized or "houston money show" in normalized),
+            "Lone Star Convention Center, 9055 Airport Rd., Conroe, TX",
+        ),
+    ]
+    for matches, venue in known:
+        if matches:
+            return venue
+    return ""
+
+
 def scrape_event(session, listing):
     response = session.get(listing["url"], timeout=45)
     response.raise_for_status()
@@ -228,6 +256,11 @@ def scrape_event(session, listing):
     description_text = " ".join(description_lines)
 
     address = extract_address(lines)
+
+    # Prefer a previously verified venue when the source page omits or mangles it.
+    verified_venue = verified_venue_override(title or listing.get("title", ""))
+    if verified_venue:
+        address = verified_venue
 
     # Prefer public event dates in the description over setup dates in the title.
     public_date_text = description_text
