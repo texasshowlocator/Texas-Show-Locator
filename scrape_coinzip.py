@@ -50,7 +50,10 @@ MONTH_DATE_RE = re.compile(
 
 
 def clean(value):
-    return re.sub(r"\s+", " ", str(value or "")).strip()
+    value = re.sub(r"\s+", " ", str(value or "")).strip()
+    value = re.sub(r"\s+(?:Add to Watch List|Watching|View Watchlist\s*>?).*$", "", value, flags=re.I)
+    value = re.sub(r"\s+View\s*$", "", value, flags=re.I)
+    return value.strip(" |•-")
 
 
 def create_session():
@@ -148,20 +151,20 @@ def extract_address(lines):
     description = lines[description_index + 1:] if description_index is not None else lines
     stop = next(
         (i for i, line in enumerate(description)
-         if re.match(r"^(questions\\s*&\\s*answers|post a question|similar listings)\\b", line, re.I)),
+         if re.match(r"^(questions\s*&\s*answers|post a question|similar listings)\b", line, re.I)),
         len(description),
     )
     description = description[:stop]
     texas_hits = [
         i for i, line in enumerate(description)
-        if re.search(r"\\b(?:TX|Texas)\\b", line, re.I)
-        and not re.search(r"\\b(?:seller|contact|email)\\b", line, re.I)
+        if re.search(r"\b(?:TX|Texas)\b", line, re.I)
+        and not re.search(r"\b(?:seller|contact|email)\b", line, re.I)
     ]
     if texas_hits:
         hit = texas_hits[-1]
         block = description[max(0, hit - 3):hit + 1]
         while block and re.search(
-            r"\\b(show hours|admission|dealer setup|december \\d|january \\d|friday|saturday)\\b",
+            r"\b(show hours|admission|dealer setup|december \d|january \d|friday|saturday)\b",
             block[0], re.I
         ):
             block.pop(0)
@@ -182,7 +185,7 @@ def scrape_event(session, listing):
     else:
         title = clean(listing["title"])
 
-    lines = [clean(line) for line in soup.get_text("\\n").splitlines() if clean(line)]
+    lines = [clean(line) for line in soup.get_text("\n").splitlines() if clean(line)]
     description_index = next(
         (i for i, line in enumerate(lines) if line.casefold() == "description"),
         None,
@@ -190,12 +193,12 @@ def scrape_event(session, listing):
     description_lines = lines[description_index + 1:] if description_index is not None else []
     description_stop = next(
         (i for i, line in enumerate(description_lines)
-         if re.match(r"^(questions\\s*&\\s*answers|post a question)\\b", line, re.I)),
+         if re.match(r"^(questions\s*&\s*answers|post a question)\b", line, re.I)),
         len(description_lines),
     )
     description_lines = description_lines[:description_stop]
     address = extract_address(lines)
-    if re.search(r",\\s*(?:AZ|CA|CO|FL|IL|NY|OK|TN|UT|VA|WA)\\b", address, re.I):
+    if re.search(r",\s*(?:AZ|CA|CO|FL|IL|NY|OK|TN|UT|VA|WA)\b", address, re.I):
         address = ""
 
     date_parts = [listing.get("title", ""), listing.get("listing_text", ""), title]
@@ -213,14 +216,14 @@ def scrape_event(session, listing):
 
     if not address:
         for line in description_lines:
-            if re.search(r"\\b[A-Z][A-Za-z .'-]+,\\s*TX(?:\\s+\\d{5})?\\b", line):
+            if re.search(r"\b[A-Z][A-Za-z .'-]+,\s*TX(?:\s+\d{5})?\b", line):
                 address = clean(line)
                 break
-            if re.search(r"\\b[A-Z][A-Za-z .'-]+,\\s*Texas\\b", line, re.I):
+            if re.search(r"\b[A-Z][A-Za-z .'-]+,\s*Texas\b", line, re.I):
                 address = clean(line)
                 break
 
-    if address and not re.search(r"\\bTX\\b|Texas", address, re.I):
+    if address and not re.search(r"\bTX\b|Texas", address, re.I):
         address = ""
     if not title or title.casefold() in {"view", "image"}:
         raise ValueError("Event title was empty after removing page controls.")
