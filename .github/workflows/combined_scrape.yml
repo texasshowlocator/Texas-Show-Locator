@@ -90,6 +90,7 @@ jobs:
           name: texas-show-locator-combined-reports
           path: |
             output/combined_texas_card_shows.csv
+            output/combined_daily_changes.csv
             output/texas_card_shows.csv
             output/ontreasure_events.csv
             output/coinzip_events.csv
