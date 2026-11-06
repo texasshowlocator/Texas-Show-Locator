@@ -149,7 +149,7 @@ def combine_daily_changes():
         writer.writeheader()
         writer.writerows(rows)
 
-    print("\\nCOMBINED DAILY CHANGES CREATED")
+    print("\nCOMBINED DAILY CHANGES CREATED")
     for source_name in SOURCE_ORDER:
         print(f"{source_name} changes: {source_counts.get(source_name, 0)}")
     print(f"Combined change rows: {len(rows)}")
