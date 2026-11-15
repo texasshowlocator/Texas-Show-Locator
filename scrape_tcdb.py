@@ -9,6 +9,7 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -662,21 +663,62 @@ def fetch_event_detail(session, listing):
 # SCRAPE ALL TCDB EVENTS
 # ============================================================
 
+def fetch_listing_html(session):
+    """Fetch the listing with requests, then retry a 403 in Chromium."""
+    try:
+        response = session.get(TCDB_URL, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        return response.text
+    except requests.exceptions.HTTPError as exc:
+        if exc.response is None or exc.response.status_code != 403:
+            raise
+
+        print("TCDB returned HTTP 403 to requests; trying Playwright Chromium...")
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                context = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (X11; Linux x86_64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/130.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1440, "height": 1000},
+                    locale="en-US",
+                )
+                page = context.new_page()
+                browser_response = page.goto(
+                    TCDB_URL,
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                page.wait_for_timeout(1500)
+                if browser_response and browser_response.status >= 400:
+                    raise RuntimeError(
+                        "TCDB browser fallback returned HTTP "
+                        f"{browser_response.status}; the site may be blocking "
+                        "the GitHub Actions runner."
+                    )
+                html = page.content()
+                if not html or "403 Forbidden" in html[:2000]:
+                    raise RuntimeError(
+                        "TCDB also blocked the Playwright browser request."
+                    )
+                return html
+            finally:
+                browser.close()
+
+
 def scrape_tcdb():
 
     session = create_session()
 
     print("Loading TCDB Texas event listing...")
 
-    response = session.get(
-        TCDB_URL,
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    response.raise_for_status()
+    listing_html = fetch_listing_html(session)
 
     soup = BeautifulSoup(
-        response.text,
+        listing_html,
         "html.parser",
     )
 
