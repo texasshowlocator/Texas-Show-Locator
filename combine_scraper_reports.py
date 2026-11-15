@@ -37,7 +37,7 @@ CHANGE_OUTPUT_COLUMNS = ["Change"] + BASE_COLUMNS + ["Source"]
 
 
 def clean(value):
-    return re.sub(r"\\s+", " ", str(value or "")).strip()
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def read_source_status(source_name):
@@ -46,7 +46,7 @@ def read_source_status(source_name):
         return False, "Audit file missing"
 
     content = audit_path.read_text(encoding="utf-8", errors="replace")
-    match = re.search(r"^Status:\\s*(.+?)\\s*$", content, re.I | re.M)
+    match = re.search(r"^Status:\s*(.+?)\s*$", content, re.I | re.M)
     if not match:
         return False, "Status line missing from audit"
     status = match.group(1).strip()
@@ -175,7 +175,7 @@ def combine_daily_changes(active_sources):
         writer.writeheader()
         writer.writerows(rows)
 
-    print("\\nCOMBINED DAILY CHANGES CREATED")
+    print("\nCOMBINED DAILY CHANGES CREATED")
     for source_name in active_sources:
         print(f"{source_name} changes: {source_counts.get(source_name, 0)}")
     print(f"Combined change rows: {len(rows)}")
@@ -186,20 +186,20 @@ def write_combined_audit(active_sources, failed_sources, event_counts):
     partial = bool(failed_sources)
     status = "PARTIAL - ONE OR MORE SOURCES FAILED" if partial else "SUCCESS"
     with COMBINED_AUDIT_FILE.open("w", encoding="utf-8") as file:
-        file.write("TEXAS SHOW LOCATOR - COMBINED REPORT AUDIT\\n")
-        file.write("=" * 55 + "\\n")
-        file.write(f"Run time: {datetime.now().isoformat(timespec='seconds')}\\n")
-        file.write(f"Status: {status}\\n")
-        file.write("Included sources: " + (", ".join(active_sources) or "None") + "\\n")
-        file.write("Excluded sources: " + (", ".join(failed_sources) or "None") + "\\n")
-        file.write("\\nEVENT COUNTS\\n")
+        file.write("TEXAS SHOW LOCATOR - COMBINED REPORT AUDIT\n")
+        file.write("=" * 55 + "\n")
+        file.write(f"Run time: {datetime.now().isoformat(timespec='seconds')}\n")
+        file.write(f"Status: {status}\n")
+        file.write("Included sources: " + (", ".join(active_sources) or "None") + "\n")
+        file.write("Excluded sources: " + (", ".join(failed_sources) or "None") + "\n")
+        file.write("\nEVENT COUNTS\n")
         for source_name in active_sources:
-            file.write(f"{source_name}: {event_counts[source_name]}\\n")
-        file.write(f"Combined unique events: {sum(event_counts.values()) if len(active_sources) == 1 else 'see combined CSV'}\\n")
+            file.write(f"{source_name}: {event_counts[source_name]}\n")
+        file.write(f"Combined unique events: {sum(event_counts.values()) if len(active_sources) == 1 else 'see combined CSV'}\n")
         if partial:
             file.write(
-                "\\nWARNING: This is a partial report. Failed sources were excluded; "
-                "their previous master CSVs and daily changes were not reused.\\n"
+                "\nWARNING: This is a partial report. Failed sources were excluded; "
+                "their previous master CSVs and daily changes were not reused.\n"
             )
 
 
