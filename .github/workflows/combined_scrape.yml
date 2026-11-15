@@ -56,12 +56,15 @@ jobs:
 
       - name: Run TCDB scraper
         run: python scrape_tcdb.py
+        continue-on-error: true
 
       - name: Run OnTreasure scraper
         run: python scrape_ontreasure.py
+        continue-on-error: true
 
       - name: Run CoinZip scraper
         run: python scrape_coinzip.py
+        continue-on-error: true
 
       - name: Build combined CSV report
         run: python combine_scraper_reports.py
@@ -91,6 +94,7 @@ jobs:
           path: |
             output/combined_texas_card_shows.csv
             output/combined_daily_changes.csv
+            output/combined_report_audit.txt
             output/texas_card_shows.csv
             output/ontreasure_events.csv
             output/coinzip_events.csv
